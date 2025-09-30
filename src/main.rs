@@ -4,23 +4,175 @@ mod tools;
 mod screenshot;
 
 use iced::{
-    widget::{column, container, scrollable, text, text_input, button, text_input::Id},
+    widget::{column, container, scrollable, text, text_input, button, text_input::Id, rich_text, span},
     Element, Length, Task, Theme, Font, Subscription,
     time, clipboard,
     keyboard::{self, Key},
     event::{self, Event as IcedEvent},
     alignment, Padding,
     window::{self, Level},
+    Color,
 };
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use pulldown_cmark::{Parser, Event as MarkdownEvent, Tag, HeadingLevel};
 
 fn render_markdown(markdown: String) -> Element<'static, Message> {
-    // Just display the text as-is without parsing
-    text(markdown)
-        .size(15)
-        .into()
+    let parser = Parser::new(&markdown);
+    let mut spans = Vec::new();
+    let mut current_text = String::new();
+    let mut in_code_block = false;
+    let mut code_block_content = String::new();
+    let mut in_bold = false;
+    let mut in_italic = false;
+    let mut heading_level: Option<HeadingLevel> = None;
+
+    for event in parser {
+        match event {
+            MarkdownEvent::Start(tag) => {
+                match tag {
+                    Tag::Heading(level, _, _) => {
+                        // Flush current text before heading
+                        if !current_text.is_empty() {
+                            spans.push(span(current_text.clone()));
+                            current_text.clear();
+                        }
+                        // Add newline before heading if there's already content
+                        if !spans.is_empty() {
+                            spans.push(span("\n\n"));
+                        }
+                        heading_level = Some(level);
+                    }
+                    Tag::CodeBlock(_) => {
+                        // Flush current text before code block
+                        if !current_text.is_empty() {
+                            spans.push(span(current_text.clone()));
+                            current_text.clear();
+                        }
+                        in_code_block = true;
+                    }
+                    Tag::Strong => {
+                        in_bold = true;
+                    }
+                    Tag::Emphasis => {
+                        in_italic = true;
+                    }
+                    Tag::Paragraph => {
+                        // Flush text at paragraph start
+                        if !current_text.is_empty() {
+                            spans.push(span(current_text.clone()));
+                            current_text.clear();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            MarkdownEvent::End(tag) => {
+                match tag {
+                    Tag::Heading(_, _, _) => {
+                        if !current_text.is_empty() {
+                            let size = match heading_level {
+                                Some(HeadingLevel::H1) => 28,
+                                Some(HeadingLevel::H2) => 24,
+                                Some(HeadingLevel::H3) => 20,
+                                Some(HeadingLevel::H4) => 18,
+                                Some(HeadingLevel::H5) => 16,
+                                _ => 15,
+                            };
+                            spans.push(
+                                span(current_text.clone())
+                                    .size(size)
+                                    .color(Color::from_rgb(0.6, 0.8, 1.0))
+                            );
+                            current_text.clear();
+                        }
+                        heading_level = None;
+                        spans.push(span("\n\n"));
+                    }
+                    Tag::CodeBlock(_) => {
+                        if !code_block_content.is_empty() {
+                            spans.push(span("\n"));
+                            spans.push(
+                                span(code_block_content.clone())
+                                    .font(Font::MONOSPACE)
+                                    .size(14)
+                                    .color(Color::from_rgb(0.8, 0.9, 0.8))
+                            );
+                            spans.push(span("\n\n"));
+                            code_block_content.clear();
+                        }
+                        in_code_block = false;
+                    }
+                    Tag::Strong => {
+                        in_bold = false;
+                    }
+                    Tag::Emphasis => {
+                        in_italic = false;
+                    }
+                    Tag::Paragraph => {
+                        if !current_text.is_empty() {
+                            let mut text_span = span(current_text.clone()).size(15);
+                            if in_bold {
+                                text_span = text_span.color(Color::from_rgb(1.0, 1.0, 1.0));
+                            }
+                            spans.push(text_span);
+                            current_text.clear();
+                        }
+                        spans.push(span("\n\n"));
+                    }
+                    _ => {}
+                }
+            }
+            MarkdownEvent::Text(t) => {
+                if in_code_block {
+                    code_block_content.push_str(&t);
+                } else {
+                    current_text.push_str(&t);
+                }
+            }
+            MarkdownEvent::Code(code) => {
+                // Flush current text
+                if !current_text.is_empty() {
+                    spans.push(span(current_text.clone()));
+                    current_text.clear();
+                }
+                // Add inline code
+                spans.push(
+                    span(format!("`{}`", code))
+                        .font(Font::MONOSPACE)
+                        .size(14)
+                        .color(Color::from_rgb(0.9, 0.6, 0.6))
+                );
+            }
+            MarkdownEvent::SoftBreak => {
+                current_text.push(' ');
+            }
+            MarkdownEvent::HardBreak => {
+                current_text.push('\n');
+            }
+            _ => {}
+        }
+    }
+
+    // Add any remaining text
+    if !current_text.is_empty() {
+        spans.push(span(current_text));
+    }
+    if !code_block_content.is_empty() {
+        spans.push(
+            span(code_block_content)
+                .font(Font::MONOSPACE)
+                .size(14)
+                .color(Color::from_rgb(0.8, 0.9, 0.8))
+        );
+    }
+
+    if spans.is_empty() {
+        text("").into()
+    } else {
+        rich_text(spans).into()
+    }
 }
 
 fn main() -> iced::Result {

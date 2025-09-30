@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn default_max_tool_turns() -> usize {
     5
@@ -44,7 +44,7 @@ impl Default for Config {
                 max_tool_turns: 5,
             },
             window: WindowConfig {
-                width: 800,
+                width: 752,  // Approximately 1/3 of typical screen width
                 height: 600,
                 min_width: 400,
                 min_height: 300,
