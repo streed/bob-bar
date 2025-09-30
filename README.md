@@ -12,6 +12,7 @@ A fast, elegant AI launcher built with Rust and Iced. bob-bar provides instant a
 - **🤖 Local AI Integration** - Connects to Ollama for private, local AI inference
 - **🔧 Tool Support** - Extensible tool system with HTTP and MCP protocol support
 - **📋 Copy Output** - One-click copy to clipboard
+- **📸 Screenshot Analysis** - Capture and analyze screenshots with vision models
 - **🎨 Beautiful UI** - Clean, modern interface with smooth animations
 - **⌨️ Keyboard-First** - ESC to close, enter to submit - stay focused
 
@@ -20,6 +21,7 @@ A fast, elegant AI launcher built with Rust and Iced. bob-bar provides instant a
 ### Prerequisites
 
 - [Ollama](https://ollama.ai) running locally
+- For screenshot feature: `grim` (Wayland) or `scrot` (X11)
 
 ### Installation
 
@@ -67,7 +69,8 @@ bob-bar uses configuration files located in `~/.config/bob-bar/`:
 ```toml
 [ollama]
 host = "http://localhost:11434"
-model = "llama2"  # or any Ollama model
+model = "llama2"                      # Model for text queries
+vision_model = "llama3.2-vision:11b"  # Model for screenshot analysis
 max_tool_turns = 5
 
 [window]
@@ -116,13 +119,22 @@ Define custom HTTP tools and MCP servers:
 
 **Starting bob-bar**
 
+Normal mode:
 ```bash
 bob-bar
+```
+
+Screenshot analysis mode:
+```bash
+bob-bar --screenshot
 ```
 
 Make sure Ollama is running first:
 ```bash
 ollama serve
+
+# For screenshot analysis, pull a vision model:
+ollama pull llama3.2-vision:11b
 ```
 
 **Using bob-bar**
@@ -132,6 +144,30 @@ ollama serve
 3. **Get instant answers** - AI responses appear with proper formatting
 4. **Copy results** - Click the [Copy] button to copy output to clipboard
 5. **Close quickly** - Press ESC to dismiss the window
+
+### Screenshot Analysis
+
+The `--screenshot` flag captures your current screen and analyzes it with a vision model:
+
+```bash
+bob-bar --screenshot
+```
+
+This will:
+1. Capture a screenshot of your current desktop (supports Wayland and X11)
+2. Send it to the vision model (configured as `vision_model` in config)
+3. Display helpful insights about what's on screen
+4. Identify issues, extract information, and suggest improvements
+
+**Requirements:**
+- Wayland: Install `grim` (`sudo apt install grim` or `sudo pacman -S grim`)
+- X11: Install `scrot` (`sudo apt install scrot`)
+
+Great for:
+- Getting help with error messages
+- Understanding complex UIs
+- Extracting text from images
+- Analyzing diagrams and charts
 
 ### Keyboard Shortcuts
 
@@ -226,6 +262,22 @@ Verify connectivity:
 
 ```bash
 curl http://localhost:11434/api/tags
+```
+
+### Screenshot Not Working
+
+Install the appropriate screenshot tool:
+
+**Wayland:**
+```bash
+sudo apt install grim    # Debian/Ubuntu
+sudo pacman -S grim      # Arch
+```
+
+**X11:**
+```bash
+sudo apt install scrot   # Debian/Ubuntu
+sudo pacman -S scrot     # Arch
 ```
 
 ### Font/Unicode Issues

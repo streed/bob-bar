@@ -1,6 +1,7 @@
 mod config;
 mod ollama;
 mod tools;
+mod screenshot;
 
 use iced::{
     widget::{column, container, scrollable, text, text_input, button, text_input::Id},
@@ -23,10 +24,33 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
 }
 
 fn main() -> iced::Result {
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let screenshot_mode = args.iter().any(|arg| arg == "--screenshot" || arg == "-screenshot");
+
     // Get screen dimensions to calculate center
     let config = config::Config::load();
 
-    iced::application("W-AI-Land", App::update, App::view)
+    if screenshot_mode {
+        // Run in screenshot mode
+        run_screenshot_mode(config)
+    } else {
+        // Normal mode
+        iced::application("bob-bar", App::update, App::view)
+            .theme(App::theme)
+            .subscription(App::subscription)
+            .window(window::Settings {
+                size: iced::Size::new(config.window.width as f32, config.window.height as f32),
+                position: window::Position::Centered,
+                ..Default::default()
+            })
+            .default_font(Font::MONOSPACE)
+            .run_with(App::new)
+    }
+}
+
+fn run_screenshot_mode(config: config::Config) -> iced::Result {
+    iced::application("bob-bar", App::update, App::view)
         .theme(App::theme)
         .subscription(App::subscription)
         .window(window::Settings {
@@ -35,7 +59,23 @@ fn main() -> iced::Result {
             ..Default::default()
         })
         .default_font(Font::MONOSPACE)
-        .run_with(App::new)
+        .run_with(|| {
+            let (mut app, mut task) = App::new();
+            app.screenshot_mode = true;
+
+            // Capture screenshot after a small delay to allow window to be hidden
+            let screenshot_task = Task::future(async {
+                // Small delay to let the app window minimize/hide
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                match screenshot::capture_screenshot() {
+                    Ok(path) => Message::ScreenshotCaptured(Ok(path)),
+                    Err(e) => Message::ScreenshotCaptured(Err(e.to_string())),
+                }
+            });
+
+            (app, Task::batch([task, screenshot_task]))
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +87,7 @@ enum Message {
     Tick,
     CopyOutput,
     Exit,
+    ScreenshotCaptured(Result<std::path::PathBuf, String>),
 }
 
 struct App {
@@ -56,6 +97,9 @@ struct App {
     loading_frame: usize,
     ollama_client: Arc<Mutex<ollama::OllamaClient>>,
     input_id: Id,
+    screenshot_mode: bool,
+    screenshot_path: Option<std::path::PathBuf>,
+    vision_model: String,
 }
 
 impl App {
@@ -106,6 +150,8 @@ impl App {
 
         let input_id = Id::unique();
 
+        let vision_model = config.ollama.vision_model.clone();
+
         let app = App {
             input_text: String::new(),
             response_text: String::new(),
@@ -113,6 +159,9 @@ impl App {
             loading_frame: 0,
             ollama_client: Arc::new(Mutex::new(ollama_client)),
             input_id: input_id.clone(),
+            screenshot_mode: false,
+            screenshot_path: None,
+            vision_model,
         };
 
         let focus_task = text_input::focus(input_id);
@@ -171,6 +220,73 @@ impl App {
             Message::Exit => {
                 iced::exit()
             }
+            Message::ScreenshotCaptured(result) => {
+                match result {
+                    Ok(path) => {
+                        self.screenshot_path = Some(path.clone());
+                        self.is_loading = true;
+                        self.response_text = "Extracting information from screenshot...".to_string();
+                        self.input_text = "Reading and analyzing screen content...".to_string();
+
+                        let client = self.ollama_client.clone();
+                        let screenshot_path = path;
+                        let vision_model = self.vision_model.clone();
+
+                        Task::future(async move {
+                            let mut client = client.lock().await;
+
+                            // Temporarily switch to vision model
+                            let original_model = client.get_model().to_string();
+                            client.set_model(vision_model);
+
+                            // Encode image as base64
+                            let result = match screenshot::encode_image_base64(&screenshot_path) {
+                                Ok(base64_image) => {
+                                    client.query_with_image(
+                                        "You are analyzing a screenshot. Your task is to extract and report ONLY what you can directly see and read.
+
+**CRITICAL RULES:**
+- ONLY report text, numbers, and visual elements you can actually see in the image
+- DO NOT guess, infer, or make assumptions about anything not clearly visible
+- DO NOT explain what code does unless you can see comments or documentation explaining it
+- DO NOT suggest fixes unless error messages explicitly state the solution
+- If text is unclear or partially visible, state \"text unclear\" rather than guessing
+- If you cannot see something clearly, say \"not visible in screenshot\"
+
+**What to extract:**
+1. **Visible text** - Transcribe exactly what you see: error messages, button labels, terminal output, code
+2. **Visible numbers** - Version numbers, error codes, line numbers, timestamps
+3. **Visible UI elements** - Application name (if shown), window titles, menu items
+4. **Visible structure** - File paths, URLs, command names (only if clearly visible)
+
+**Format your response as:**
+- **Text Content:** [Quote exact text you see]
+- **Key Information:** [Only concrete data visible: error codes, versions, paths]
+- **Visual Context:** [What application/interface is shown, if identifiable]
+- **Notable Elements:** [Any important UI elements or indicators you see]
+
+Remember: Only report what is objectively visible. Do not interpret, explain, or suggest unless the image itself contains that information.",
+                                        &base64_image
+                                    ).await
+                                }
+                                Err(e) => Err(anyhow::anyhow!("Error encoding image: {}", e)),
+                            };
+
+                            // Restore original model
+                            client.set_model(original_model);
+
+                            match result {
+                                Ok(response) => Message::ResponseReceived(response),
+                                Err(e) => Message::Error(format!("Error analyzing screenshot: {}", e)),
+                            }
+                        })
+                    }
+                    Err(e) => {
+                        self.response_text = format!("Error capturing screenshot: {}", e);
+                        Task::none()
+                    }
+                }
+            }
         }
     }
 
@@ -197,26 +313,44 @@ impl App {
     }
 
     fn view(&self) -> Element<Message> {
-        let input = text_input("Type your message...", &self.input_text)
-            .on_input(Message::InputChanged)
-            .on_submit(Message::Submit)
+        let mut input = text_input("Type your message...", &self.input_text)
             .padding(15)
             .size(18)
             .id(self.input_id.clone());
 
+        // Only enable input when not loading
+        if !self.is_loading {
+            input = input
+                .on_input(Message::InputChanged)
+                .on_submit(Message::Submit);
+        }
+
         let output: Element<Message> = if self.is_loading {
             // Show animated loading text with fun messages using unicode spinner
             let loading_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let loading_messages = [
-                "Consulting the digital oracle...",
-                "Summoning AI wisdom...",
-                "Asking the machines nicely...",
-                "Brewing up an answer...",
-                "Thinking really hard...",
-                "Channeling silicon spirits...",
-                "Calculating probabilities...",
-                "Parsing the universe...",
-            ];
+            let loading_messages = if self.screenshot_mode {
+                [
+                    "Reading visible text...",
+                    "Extracting exact content...",
+                    "Transcribing screen elements...",
+                    "Identifying visible information...",
+                    "Processing text and data...",
+                    "Analyzing visible content...",
+                    "Extracting concrete information...",
+                    "Reading screen accurately...",
+                ]
+            } else {
+                [
+                    "Consulting the digital oracle...",
+                    "Summoning AI wisdom...",
+                    "Asking the machines nicely...",
+                    "Brewing up an answer...",
+                    "Thinking really hard...",
+                    "Channeling silicon spirits...",
+                    "Calculating probabilities...",
+                    "Parsing the universe...",
+                ]
+            };
 
             let message_idx = (self.loading_frame / 10) % loading_messages.len();
             let spinner_idx = self.loading_frame % loading_frames.len();

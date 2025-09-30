@@ -12,10 +12,16 @@ pub struct Config {
     pub window: WindowConfig,
 }
 
+fn default_vision_model() -> String {
+    "llama3.2-vision:11b".to_string()
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct OllamaConfig {
     pub host: String,
     pub model: String,
+    #[serde(default = "default_vision_model")]
+    pub vision_model: String,
     #[serde(default = "default_max_tool_turns")]
     pub max_tool_turns: usize,
 }
@@ -34,6 +40,7 @@ impl Default for Config {
             ollama: OllamaConfig {
                 host: "http://localhost:11434".to_string(),
                 model: "llama2".to_string(),
+                vision_model: "llama3.2-vision:11b".to_string(),
                 max_tool_turns: 5,
             },
             window: WindowConfig {

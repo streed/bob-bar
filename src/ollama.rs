@@ -64,6 +64,8 @@ struct Message {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -132,15 +134,23 @@ impl OllamaClient {
         self.tool_executor = Some(executor);
     }
 
+    pub fn get_model(&self) -> &str {
+        &self.model
+    }
+
     pub async fn query(&mut self, prompt: &str) -> Result<String> {
-        self.query_internal(prompt, true).await
+        self.query_internal(prompt, true, None).await
+    }
+
+    pub async fn query_with_image(&mut self, prompt: &str, base64_image: &str) -> Result<String> {
+        self.query_internal(prompt, false, Some(base64_image.to_string())).await
     }
 
     fn query_without_tools<'a>(&'a mut self, prompt: &'a str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
-        Box::pin(self.query_internal(prompt, false))
+        Box::pin(self.query_internal(prompt, false, None))
     }
 
-    async fn query_internal(&mut self, initial_prompt: &str, allow_tools: bool) -> Result<String> {
+    async fn query_internal(&mut self, initial_prompt: &str, allow_tools: bool, image: Option<String>) -> Result<String> {
         let prompt_for_iteration = initial_prompt.to_string();
 
             // Build prompt with tool descriptions if available and allowed
@@ -193,6 +203,7 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
                 role: "user".to_string(),
                 content: enhanced_prompt,
                 tool_calls: None,
+                images: image.map(|img| vec![img]),
             }],
             stream: false,
             tools: None,

@@ -153,6 +153,11 @@ host = "http://localhost:11434"
 # See available models: ollama list
 model = "llama2"
 
+# Vision model to use for analyzing screenshots
+# Options: llama3.2-vision:11b, llava, llava:13b, bakllava, etc.
+# See available models: ollama list
+vision_model = "llama3.2-vision:11b"
+
 # Maximum number of tool iterations per query
 # This prevents infinite loops when chaining tools
 # Default: 5
@@ -221,6 +226,20 @@ else
 fi
 
 # Check if install directory is in PATH
+# Check for screenshot tool
+echo ""
+echo "Checking for screenshot tool..."
+if command -v grim &> /dev/null; then
+    echo -e "${GREEN}✓${NC} Found grim (Wayland screenshot tool)"
+elif command -v scrot &> /dev/null; then
+    echo -e "${GREEN}✓${NC} Found scrot (X11 screenshot tool)"
+else
+    echo -e "${YELLOW}⚠${NC}  No screenshot tool found"
+    echo "For screenshot analysis, install one of:"
+    echo "  - Wayland: sudo apt install grim"
+    echo "  - X11: sudo apt install scrot"
+fi
+
 echo ""
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     echo -e "${YELLOW}⚠${NC}  $INSTALL_DIR is not in your PATH"

@@ -12,6 +12,11 @@ host = "http://localhost:11434"
 # See available models: ollama list
 model = "llama2"
 
+# Vision model to use for analyzing screenshots
+# Options: llama3.2-vision:11b, llava, llava:13b, bakllava, etc.
+# See available models: ollama list
+vision_model = "llama3.2-vision:11b"
+
 # Maximum number of tool iterations per query
 # This prevents infinite loops when chaining tools
 # Default: 5
