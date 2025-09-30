@@ -1,0 +1,61 @@
+{
+  "tools": {
+    "http": [
+      {
+        "name": "weather",
+        "description": "Get current weather conditions and forecast for any location worldwide. Returns temperature, conditions, wind, and precipitation. Accepts city names, landmarks, airport codes, area codes, or GPS coordinates.",
+        "endpoint": "https://wttr.in/{query}?T&u&format=4",
+        "method": "GET",
+        "parameters": {
+          "query": {
+            "type": "string",
+            "description": "Location to get weather for. Can be: a city name (e.g., 'London', 'New York'), a landmark prefixed with ~ (e.g., '~Empire State Building'), a 3-character airport code (e.g., 'IAD', 'MUC'), an area code (e.g., '94301'), or GPS coordinates in lat,long format (e.g., '38.9072,-77.0369'). Do not include spaces in GPS coordinates.",
+            "required": true
+          }
+        },
+        "path_params": ["query"],
+        "response_format": "text"
+      },
+      {
+        "name": "web_search",
+        "description": "Search the internet for current information, news, facts, or any topic. Returns a list of relevant search results with titles, URLs, and snippets. Use this when you need up-to-date information not in your knowledge base or to verify current facts.",
+        "endpoint": "https://ollama.com/api/web_search",
+        "method": "POST",
+        "parameters": {
+          "query": {
+            "type": "string",
+            "description": "The search query string. Be specific and use natural language. Include relevant keywords and context. Example: 'latest SpaceX launch 2024' or 'Python async await tutorial'.",
+            "required": true
+          }
+        },
+        "path_params": [],
+        "headers": {
+          "Authorization": "Bearer ${OLLAMA_API_KEY}",
+          "Content-Type": "application/json"
+        },
+        "response_format": "json",
+        "response_path": "results"
+      },
+      {
+        "name": "web_fetch",
+        "description": "Retrieve and extract the full text content from any web page URL. Returns the page's main content with HTML stripped. Use this to read articles, documentation, or any web page content when you need more detail than a search result provides.",
+        "endpoint": "https://ollama.com/api/web_fetch",
+        "method": "POST",
+        "parameters": {
+          "url": {
+            "type": "string",
+            "description": "The complete URL of the web page to fetch. Must include the protocol (http:// or https://). Example: 'https://example.com/article' or 'https://docs.python.org/3/library/asyncio.html'."
+          }
+        },
+        "path_params": [],
+        "headers": {
+          "Authorization": "Bearer ${OLLAMA_API_KEY}",
+          "Content-Type": "application/json"
+        },
+        "response_format": "json"
+      }
+    ],
+    "mcp": [
+    ]
+  }
+}

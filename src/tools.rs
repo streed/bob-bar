@@ -1,0 +1,695 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::process::Stdio;
+use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use toml;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolsConfig {
+    pub tools: Tools,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tools {
+    pub http: Vec<HttpTool>,
+    pub mcp: Vec<McpServer>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpTool {
+    pub name: String,
+    pub description: String,
+    pub endpoint: String,
+    pub method: String,
+    pub parameters: HashMap<String, ParameterDef>,
+    #[serde(default)]
+    pub path_params: Vec<String>,  // List of parameter names that should be used in the path
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    pub response_format: String,
+    #[serde(default)]
+    pub response_path: Option<String>,  // Optional JSON path to extract from response (e.g., "data.results[0].value")
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ParameterDef {
+    #[serde(rename = "type")]
+    pub param_type: String,
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
+    pub default: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpServer {
+    pub name: String,
+    pub transport: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub description: String,
+    pub env: HashMap<String, String>,
+}
+
+#[derive(Debug)]
+pub struct McpConnection {
+    process: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: BufReader<tokio::process::ChildStdout>,
+}
+
+pub struct ToolExecutor {
+    pub config: ToolsConfig,
+    http_client: reqwest::Client,
+    mcp_connections: HashMap<String, McpConnection>,
+    mcp_tools: HashMap<String, Vec<McpTool>>,  // Store discovered MCP tools per server
+    api_keys: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpTool {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Option<Value>,
+}
+
+impl ToolExecutor {
+    pub fn new(config: ToolsConfig, api_keys: HashMap<String, String>) -> Self {
+        ToolExecutor {
+            config,
+            http_client: reqwest::Client::new(),
+            mcp_connections: HashMap::new(),
+            mcp_tools: HashMap::new(),
+            api_keys,
+        }
+    }
+
+    pub fn from_file(path: &std::path::Path) -> Result<Self, anyhow::Error> {
+        // Load tools config
+        let config_str = std::fs::read_to_string(path)?;
+        let config: ToolsConfig = serde_json::from_str(&config_str)?;
+
+        // Load API keys from config directory
+        let config_dir = crate::config::Config::get_config_dir();
+        let api_keys_path = config_dir.join("api_keys.toml");
+
+        let api_keys = load_api_keys(&api_keys_path).unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to load api_keys.toml: {}", e);
+            HashMap::new()
+        });
+
+        Ok(Self::new(config, api_keys))
+    }
+
+    pub async fn initialize_mcp_servers(&mut self) -> Result<(), anyhow::Error> {
+        let servers = self.config.tools.mcp.clone();
+        if servers.is_empty() {
+            println!("[MCP] No MCP servers configured");
+            return Ok(());
+        }
+
+        println!("[MCP] Initializing {} MCP servers...", servers.len());
+        for server in servers {
+            println!("[MCP] Connecting to server: {}", server.name);
+            match self.connect_mcp_server(server.clone()).await {
+                Ok(_) => println!("[MCP] ✓ Successfully connected to: {}", server.name),
+                Err(e) => eprintln!("[MCP] ✗ Failed to connect to {}: {}", server.name, e),
+            }
+        }
+        Ok(())
+    }
+
+    async fn connect_mcp_server(&mut self, server: McpServer) -> Result<(), anyhow::Error> {
+        if server.transport != "stdio" {
+            return Err(anyhow::anyhow!("Unsupported transport: {}", server.transport));
+        }
+
+        println!("[MCP] Starting process: {} {:?}", server.command, server.args);
+        let mut cmd = Command::new(&server.command);
+        cmd.args(&server.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());  // Capture stderr for debugging
+
+        for (key, value) in &server.env {
+            println!("[MCP] Setting env var: {}=***", key);
+            cmd.env(key, value);
+        }
+
+        let mut process = cmd.spawn()?;
+        println!("[MCP] Process spawned for: {}", server.name);
+        let stdin = process.stdin.take().ok_or_else(|| anyhow::anyhow!("Failed to get stdin"))?;
+        let stdout = process.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to get stdout"))?;
+        let stderr = process.stderr.take().ok_or_else(|| anyhow::anyhow!("Failed to get stderr"))?;
+        let stdout = BufReader::new(stdout);
+
+        // Spawn a task to log stderr output
+        let server_name_clone = server.name.clone();
+        tokio::spawn(async move {
+            let mut stderr_reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while let Ok(bytes) = stderr_reader.read_line(&mut line).await {
+                if bytes == 0 { break; }
+                if !line.trim().is_empty() {
+                    eprintln!("[MCP] {} stderr: {}", server_name_clone, line.trim());
+                }
+                line.clear();
+            }
+        });
+
+        let connection = McpConnection {
+            process,
+            stdin,
+            stdout,
+        };
+
+        self.mcp_connections.insert(server.name.clone(), connection);
+
+        // Send initialization message
+        self.initialize_mcp_connection(&server.name).await?;
+
+        Ok(())
+    }
+
+    async fn initialize_mcp_connection(&mut self, server_name: &str) -> Result<(), anyhow::Error> {
+        let init_message = json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "0.1.0",
+                "capabilities": {
+                    "roots": {
+                        "listChanged": true
+                    }
+                }
+            },
+            "id": 1
+        });
+
+        self.send_mcp_message(server_name, &init_message).await?;
+        // Read and process the response
+        let init_response = self.read_mcp_response(server_name).await?;
+        println!("[MCP] Initialize response: {:?}", init_response);
+
+        // Now request the list of tools
+        let list_tools_message = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/list",
+            "params": {},
+            "id": 2
+        });
+
+        println!("[MCP] Requesting tool list from {}", server_name);
+        self.send_mcp_message(server_name, &list_tools_message).await?;
+        let tools_response = self.read_mcp_response(server_name).await?;
+
+        // Parse the tools from the response
+        if let Some(result) = tools_response.get("result") {
+            if let Some(tools_array) = result.get("tools") {
+                if let Ok(tools) = serde_json::from_value::<Vec<McpTool>>(tools_array.clone()) {
+                    println!("[MCP] {} tools discovered from {}:", tools.len(), server_name);
+                    for tool in &tools {
+                        println!("[MCP]   • {}: {}", tool.name, tool.description.as_ref().unwrap_or(&"No description".to_string()));
+                    }
+                    self.mcp_tools.insert(server_name.to_string(), tools);
+                } else {
+                    println!("[MCP] Failed to parse tools from response");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_mcp_message(&mut self, server_name: &str, message: &Value) -> Result<(), anyhow::Error> {
+        println!("[MCP] Sending message to {}: {}", server_name, message);
+        let connection = self.mcp_connections.get_mut(server_name)
+            .ok_or_else(|| anyhow::anyhow!("MCP server {} not connected", server_name))?;
+
+        let msg_str = message.to_string();
+        connection.stdin.write_all(msg_str.as_bytes()).await?;
+        connection.stdin.write_all(b"\n").await?;
+        connection.stdin.flush().await?;
+        println!("[MCP] Message sent to: {}", server_name);
+
+        Ok(())
+    }
+
+    async fn read_mcp_response(&mut self, server_name: &str) -> Result<Value, anyhow::Error> {
+        println!("[MCP] Reading response from: {}", server_name);
+        let connection = self.mcp_connections.get_mut(server_name)
+            .ok_or_else(|| anyhow::anyhow!("MCP server {} not connected", server_name))?;
+
+        // Keep reading lines until we get a valid JSON response
+        // Some MCP servers might output debug info to stdout
+        let mut attempts = 0;
+        loop {
+            let mut line = String::new();
+            let bytes_read = connection.stdout.read_line(&mut line).await?;
+
+            if bytes_read == 0 {
+                return Err(anyhow::anyhow!("MCP server {} disconnected unexpectedly", server_name));
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            println!("[MCP] Raw response from {}: {}", server_name,
+                if trimmed.len() > 200 {
+                    format!("{}...", &trimmed[..200])
+                } else {
+                    trimmed.to_string()
+                });
+
+            // Try to parse as JSON
+            match serde_json::from_str::<Value>(trimmed) {
+                Ok(response) => {
+                    println!("[MCP] Successfully parsed JSON response");
+                    return Ok(response);
+                },
+                Err(e) => {
+                    // If it's not JSON, it might be debug output
+                    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                        // Looks like JSON but failed to parse
+                        println!("[MCP] Failed to parse JSON: {}", e);
+                        if attempts > 5 {
+                            return Err(anyhow::anyhow!("Failed to parse JSON response after retries"));
+                        }
+                    } else {
+                        // Probably debug output, skip it
+                        println!("[MCP] Skipping non-JSON output: {}", trimmed);
+                    }
+                }
+            }
+
+            attempts += 1;
+            if attempts > 10 {
+                return Err(anyhow::anyhow!("Too many attempts reading MCP response"));
+            }
+        }
+    }
+
+    fn extract_json_path(&self, json: &Value, path: &str) -> Result<Value, anyhow::Error> {
+        println!("[JSON] Extracting path: {} from response", path);
+
+        let mut current = json.clone();
+        let parts: Vec<&str> = path.split('.').collect();
+
+        for part in parts {
+            // Handle array indexing like "results[0]"
+            if part.contains('[') && part.contains(']') {
+                let bracket_start = part.find('[').unwrap();
+                let bracket_end = part.find(']').unwrap();
+                let field_name = &part[..bracket_start];
+                let index_str = &part[bracket_start + 1..bracket_end];
+
+                // First get the field if it exists
+                if !field_name.is_empty() {
+                    current = current.get(field_name)
+                        .ok_or_else(|| anyhow::anyhow!("Field '{}' not found in JSON", field_name))?
+                        .clone();
+                }
+
+                // Then apply the index
+                if let Ok(index) = index_str.parse::<usize>() {
+                    current = current.as_array()
+                        .ok_or_else(|| anyhow::anyhow!("Expected array at '{}'", part))?
+                        .get(index)
+                        .ok_or_else(|| anyhow::anyhow!("Index {} out of bounds", index))?
+                        .clone();
+                } else {
+                    return Err(anyhow::anyhow!("Invalid array index: {}", index_str));
+                }
+            } else {
+                // Simple field access
+                current = current.get(part)
+                    .ok_or_else(|| anyhow::anyhow!("Field '{}' not found in JSON", part))?
+                    .clone();
+            }
+        }
+
+        println!("[JSON] Successfully extracted value from path: {}", path);
+        Ok(current)
+    }
+
+    fn parse_value_by_type(&self, value: &str, param_type: &str) -> Value {
+        match param_type.to_lowercase().as_str() {
+            "number" => {
+                // Try to parse as integer first, then as float
+                if let Ok(n) = value.parse::<i64>() {
+                    Value::Number(serde_json::Number::from(n))
+                } else if let Ok(f) = value.parse::<f64>() {
+                    serde_json::Number::from_f64(f)
+                        .map(Value::Number)
+                        .unwrap_or_else(|| Value::String(value.to_string()))
+                } else {
+                    Value::String(value.to_string())
+                }
+            },
+            "boolean" | "bool" => {
+                match value.to_lowercase().as_str() {
+                    "true" | "1" | "yes" | "y" => Value::Bool(true),
+                    "false" | "0" | "no" | "n" => Value::Bool(false),
+                    _ => Value::String(value.to_string())
+                }
+            },
+            "array" => {
+                // Try to parse as JSON array
+                if let Ok(arr) = serde_json::from_str::<Vec<Value>>(value) {
+                    Value::Array(arr)
+                } else {
+                    // If not valid JSON, treat as comma-separated values
+                    let items: Vec<Value> = value.split(',')
+                        .map(|s| Value::String(s.trim().to_string()))
+                        .collect();
+                    Value::Array(items)
+                }
+            },
+            "object" => {
+                // Try to parse as JSON object
+                serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
+            },
+            _ => Value::String(value.to_string())
+        }
+    }
+
+    pub async fn execute_http_tool(&self, tool_name: &str, params: HashMap<String, String>)
+        -> Result<Value, anyhow::Error> {
+
+        println!("[HTTP] Executing tool: {} with params: {:?}", tool_name, params);
+        let tool = self.config.tools.http.iter()
+            .find(|t| t.name == tool_name)
+            .ok_or_else(|| anyhow::anyhow!("HTTP tool '{}' not found", tool_name))?;
+
+        // Separate path parameters from query/body parameters
+        let mut path_param_values = HashMap::new();
+        let mut final_params: HashMap<String, Value> = HashMap::new();
+
+        for (key, param_def) in &tool.parameters {
+            let value = if let Some(default) = &param_def.default {
+                // Default values ALWAYS override what the LLM provides
+                // This allows us to force certain parameter values
+                match default {
+                    Value::String(s) if s.starts_with("${") && s.ends_with("}") => {
+                        // Environment variable substitution
+                        let key_name = &s[2..s.len()-1];
+                        let env_value = self.api_keys.get(key_name)
+                            .cloned()
+                            .or_else(|| std::env::var(key_name).ok())
+                            .unwrap_or_else(|| s.clone());
+                        self.parse_value_by_type(&env_value, &param_def.param_type)
+                    },
+                    _ => default.clone()
+                }
+            } else if let Some(string_value) = params.get(key) {
+                // Parse the provided string value according to its type
+                self.parse_value_by_type(string_value, &param_def.param_type)
+            } else if param_def.required {
+                return Err(anyhow::anyhow!("Missing required parameter: {}", key));
+            } else {
+                continue;
+            };
+
+            // Check if this is a path parameter (path params need to be strings)
+            if tool.path_params.contains(key) {
+                let string_value = match &value {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => serde_json::to_string(&value)?
+                };
+                path_param_values.insert(key.clone(), string_value);
+            } else {
+                final_params.insert(key.clone(), value);
+            }
+        }
+
+        // Process the endpoint URL with path parameters
+        let mut final_endpoint = tool.endpoint.clone();
+
+        // Replace {param_name} and :param_name placeholders in the URL
+        for param_name in &tool.path_params {
+            if let Some(value) = path_param_values.get(param_name) {
+                println!("[HTTP] Replacing path parameter '{}' with: {}", param_name, value);
+                // Support both {param} and :param styles
+                final_endpoint = final_endpoint
+                    .replace(&format!("{{{}}}", param_name), value)
+                    .replace(&format!(":{}", param_name), value);
+            } else if tool.parameters.get(param_name).map_or(false, |p| p.required) {
+                println!("[HTTP] Warning: Required path parameter {} not found", param_name);
+            }
+        }
+
+        println!("[HTTP] Final endpoint after path substitution: {}", final_endpoint);
+
+        // Process headers with environment variable substitution
+        let mut request_builder = match tool.method.as_str() {
+            "GET" => self.http_client.get(&final_endpoint),
+            "POST" => self.http_client.post(&final_endpoint),
+            "PUT" => self.http_client.put(&final_endpoint),
+            "DELETE" => self.http_client.delete(&final_endpoint),
+            "PATCH" => self.http_client.patch(&final_endpoint),
+            _ => return Err(anyhow::anyhow!("Unsupported HTTP method: {}", tool.method)),
+        };
+
+        // Add headers with variable substitution
+        for (header_name, header_value) in &tool.headers {
+            println!("[HTTP] Processing header: {} with value: {}", header_name, header_value);
+
+            let processed_value = if header_value.contains("${") {
+                // Process environment variable substitution
+                let mut value = header_value.clone();
+                println!("[HTTP] Found variable in header value, starting substitution...");
+
+                // Find all ${VAR_NAME} patterns and replace them
+                while let Some(start) = value.find("${") {
+                    if let Some(end) = value[start..].find('}') {
+                        let var_name = &value[start + 2..start + end];
+                        println!("[HTTP] Looking for variable: {}", var_name);
+
+                        // Try api_keys first
+                        let replacement = if let Some(api_key) = self.api_keys.get(var_name) {
+                            println!("[HTTP] Found {} in api_keys.toml", var_name);
+                            api_key.clone()
+                        } else if let Ok(env_val) = std::env::var(var_name) {
+                            println!("[HTTP] Found {} in environment variables", var_name);
+                            env_val
+                        } else {
+                            println!("[HTTP] Warning: Variable {} not found in api_keys.toml or environment", var_name);
+                            format!("${{{}}}", var_name)
+                        };
+
+                        // Mask sensitive values in logs
+                        let log_replacement = if var_name.contains("KEY") || var_name.contains("TOKEN") || var_name.contains("SECRET") {
+                            "***MASKED***".to_string()
+                        } else if replacement.len() > 20 {
+                            format!("{}...", &replacement[..20])
+                        } else {
+                            replacement.clone()
+                        };
+                        println!("[HTTP] Replacing ${{{0}}} with: {1}", var_name, log_replacement);
+                        value.replace_range(start..=start + end, &replacement);
+                    } else {
+                        break;
+                    }
+                }
+                value
+            } else {
+                println!("[HTTP] No variables to substitute in header value");
+                header_value.clone()
+            };
+
+            // Mask sensitive headers in logs
+            let log_value = if header_name.to_lowercase().contains("auth")
+                || header_name.to_lowercase().contains("key")
+                || header_name.to_lowercase().contains("token") {
+                "***MASKED***".to_string()
+            } else {
+                processed_value.clone()
+            };
+
+            println!("[HTTP] Setting header: {} = {}", header_name, log_value);
+            request_builder = request_builder.header(header_name, processed_value);
+        }
+
+        println!("[HTTP] Making {} request to: {}", tool.method, tool.endpoint);
+
+        // Add query parameters or JSON body based on method
+        let response = match tool.method.as_str() {
+            "GET" => {
+                // Convert Values to strings for query parameters
+                let query_params: HashMap<String, String> = final_params.iter()
+                    .map(|(k, v)| {
+                        let string_value = match v {
+                            Value::String(s) => s.clone(),
+                            Value::Number(n) => n.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            _ => serde_json::to_string(v).unwrap_or_default()
+                        };
+                        (k.clone(), string_value)
+                    })
+                    .collect();
+                println!("[HTTP] Adding query parameters: {:?}", query_params);
+                request_builder
+                    .query(&query_params)
+                    .send()
+                    .await?
+            },
+            "POST" => {
+                println!("[HTTP] Sending JSON body: {:?}", final_params);
+                request_builder
+                    .json(&final_params)
+                    .send()
+                    .await?
+            },
+            _ => unreachable!(),
+        };
+
+        println!("[HTTP] Response status: {}", response.status());
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response.text().await.unwrap_or_else(|_| "Could not read error response".to_string());
+            println!("[HTTP] Error response body: {}", error_body);
+            return Err(anyhow::anyhow!("HTTP {} error: {}", status, error_body));
+        }
+
+        let mut result = match tool.response_format.as_str() {
+            "json" => response.json().await?,
+            _ => json!({"text": response.text().await?}),
+        };
+
+        // Apply JSON path extraction if specified
+        if let Some(path) = &tool.response_path {
+            result = self.extract_json_path(&result, path)?;
+        }
+
+        println!("[HTTP] Tool {} executed successfully", tool_name);
+        Ok(result)
+    }
+
+    pub async fn execute_mcp_tool(&mut self, server_name: &str, tool_name: &str, params: Value)
+        -> Result<Value, anyhow::Error> {
+
+        println!("[MCP] Executing tool '{}' on server: {}", tool_name, server_name);
+
+        // MCP tools are called with tools/call method
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": params
+            },
+            "id": 3
+        });
+
+        self.send_mcp_message(server_name, &message).await?;
+        let response = self.read_mcp_response(server_name).await?;
+        println!("[MCP] Tool execution completed for: {}", server_name);
+
+        // Extract the result from the response
+        if let Some(result) = response.get("result") {
+            Ok(result.clone())
+        } else if let Some(error) = response.get("error") {
+            Err(anyhow::anyhow!("MCP error: {}", error))
+        } else {
+            Ok(response)
+        }
+    }
+
+    pub fn get_tool_descriptions(&self) -> Vec<ToolDescription> {
+        let mut descriptions = Vec::new();
+
+        // HTTP tools
+        for tool in &self.config.tools.http {
+            descriptions.push(ToolDescription {
+                name: tool.name.clone(),
+                tool_type: "http".to_string(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.iter().map(|(name, def)| {
+                    ParameterDescription {
+                        name: name.clone(),
+                        param_type: def.param_type.clone(),
+                        description: def.description.clone(),
+                        required: def.required,
+                    }
+                }).collect(),
+            });
+        }
+
+        // MCP tools - include actual discovered tools
+        for (server_name, tools) in &self.mcp_tools {
+            for tool in tools {
+                descriptions.push(ToolDescription {
+                    name: format!("{}:{}", server_name, tool.name),  // Prefix with server name
+                    tool_type: "mcp".to_string(),
+                    description: tool.description.clone().unwrap_or_else(|| format!("MCP tool from {}", server_name)),
+                    parameters: vec![],  // TODO: Parse from input_schema if needed
+                });
+            }
+        }
+
+        descriptions
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolDescription {
+    pub name: String,
+    pub tool_type: String,
+    pub description: String,
+    pub parameters: Vec<ParameterDescription>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ParameterDescription {
+    pub name: String,
+    pub param_type: String,
+    pub description: String,
+    pub required: bool,
+}
+
+pub fn load_tools_config(path: &str) -> Result<ToolsConfig, anyhow::Error> {
+    println!("[TOOLS] Loading tools configuration from: {}", path);
+    let contents = std::fs::read_to_string(path)?;
+
+    // Handle empty or invalid JSON files
+    if contents.trim().is_empty() {
+        println!("[TOOLS] Configuration file is empty");
+        return Ok(ToolsConfig {
+            tools: Tools {
+                http: Vec::new(),
+                mcp: Vec::new(),
+            }
+        });
+    }
+
+    let config: ToolsConfig = serde_json::from_str(&contents)
+        .map_err(|e| anyhow::anyhow!("Failed to parse tools.json: {}", e))?;
+
+    println!("[TOOLS] Successfully loaded {} HTTP tools and {} MCP servers",
+        config.tools.http.len(),
+        config.tools.mcp.len());
+
+    Ok(config)
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiKeysConfig {
+    keys: HashMap<String, String>,
+}
+
+pub fn load_api_keys(path: &std::path::Path) -> Result<HashMap<String, String>, anyhow::Error> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let contents = std::fs::read_to_string(path)?;
+    let config: ApiKeysConfig = toml::from_str(&contents)?;
+    Ok(config.keys)
+}

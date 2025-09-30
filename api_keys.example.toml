@@ -1,0 +1,26 @@
+# API Keys Configuration Example
+# Copy this file to api_keys.toml and add your actual API keys
+# IMPORTANT: Never commit api_keys.toml to version control!
+
+[keys]
+# OpenWeather API key for weather tool
+# Get your key at: https://openweathermap.org/api
+OPENWEATHER_API_KEY = "your_openweather_api_key_here"
+
+# GitHub Personal Access Token for GitHub API
+# Create at: https://github.com/settings/tokens
+GITHUB_TOKEN = "your_github_token_here"
+
+# OpenAI API Key (if using OpenAI tools)
+# Get from: https://platform.openai.com/api-keys
+OPENAI_API_KEY = "your_openai_api_key_here"
+
+# Brave Search API Key
+# Get from: https://brave.com/search/api/
+BRAVE_API_KEY = "your_brave_api_key_here"
+
+# Ollama API Key (for Ollama Cloud)
+OLLAMA_API_KEY = "your_ollama_api_key_here"
+
+# Add your custom API keys below
+# MY_CUSTOM_API_KEY = "your_custom_key_here"

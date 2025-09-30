@@ -1,0 +1,28 @@
+# bob-bar Configuration Example
+# Copy this file to config.toml and customize as needed
+
+# Ollama server configuration
+[ollama]
+# Base URL for the Ollama server
+# Default: http://localhost:11434
+host = "http://localhost:11434"
+
+# Model to use for generating responses
+# Options: llama2, codellama, mistral, llama2:13b, etc.
+# See available models: ollama list
+model = "llama2"
+
+# Maximum number of tool iterations per query
+# This prevents infinite loops when chaining tools
+# Default: 5
+max_tool_turns = 5
+
+# Window configuration
+[window]
+# Initial window dimensions (in pixels)
+width = 1200
+height = 1200
+
+# Minimum window size (in pixels)
+min_width = 400
+min_height = 300

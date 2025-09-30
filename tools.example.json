@@ -1,0 +1,40 @@
+{
+  "tools": {
+    "http": [
+      {
+        "name": "weather",
+        "description": "Get current weather information for a city",
+        "url": "https://api.openweathermap.org/data/2.5/weather",
+        "method": "GET",
+        "parameters": {
+          "q": "{{city}}",
+          "appid": "$OPENWEATHER_API_KEY",
+          "units": "metric"
+        }
+      },
+      {
+        "name": "search",
+        "description": "Search the web using Brave Search API",
+        "url": "https://api.search.brave.com/res/v1/web/search",
+        "method": "GET",
+        "headers": {
+          "X-Subscription-Token": "$BRAVE_API_KEY"
+        },
+        "parameters": {
+          "q": "{{query}}"
+        }
+      },
+      {
+        "name": "github_user",
+        "description": "Get information about a GitHub user",
+        "url": "https://api.github.com/users/{{username}}",
+        "method": "GET",
+        "headers": {
+          "Authorization": "token $GITHUB_TOKEN",
+          "Accept": "application/vnd.github.v3+json"
+        }
+      }
+    ],
+    "mcp": []
+  }
+}
