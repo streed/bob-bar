@@ -19,21 +19,39 @@ A fast, elegant AI launcher built with Rust and Iced. bob-bar provides instant a
 
 ### Prerequisites
 
-- Rust 1.70 or higher
 - [Ollama](https://ollama.ai) running locally
 
 ### Installation
 
+**Quick Install (Linux)**
+
 ```bash
+curl -fsSL https://raw.githubusercontent.com/streed/bob-bar/main/install.sh | bash
+```
+
+The install script will:
+- Download the latest release for your architecture (x86_64 or aarch64)
+- Install bob-bar to `~/.local/bin/bob-bar`
+- Create default configuration files in `~/.config/bob-bar/`
+- Check for required dependencies
+
+**Manual Installation**
+
+If you prefer to build from source:
+
+```bash
+# Prerequisites: Rust 1.70 or higher
+# Install from: https://rustup.rs
+
 # Clone the repository
 git clone https://github.com/streed/bob-bar.git
 cd bob-bar
 
-# Build and run
+# Build and install
 cargo build --release
-./target/release/bob-bar
+sudo cp target/release/bob-bar /usr/local/bin/
 
-# Optional: Copy example configurations
+# Setup configuration
 mkdir -p ~/.config/bob-bar
 cp config.example.toml ~/.config/bob-bar/config.toml
 cp api_keys.example.toml ~/.config/bob-bar/api_keys.toml
@@ -96,6 +114,19 @@ Define custom HTTP tools and MCP servers:
 
 ## Usage
 
+**Starting bob-bar**
+
+```bash
+bob-bar
+```
+
+Make sure Ollama is running first:
+```bash
+ollama serve
+```
+
+**Using bob-bar**
+
 1. **Launch the app** - bob-bar appears centered on your screen
 2. **Type your question** - The input field is auto-focused
 3. **Get instant answers** - AI responses appear with proper formatting
@@ -150,6 +181,22 @@ cargo build --release
 # Run with logging
 RUST_LOG=debug cargo run
 ```
+
+### Creating a Release
+
+To create a new release:
+
+```bash
+# Tag the release
+git tag v0.1.0
+git push origin main
+git push origin v0.1.0
+```
+
+GitHub Actions will automatically:
+- Build binaries for x86_64 and aarch64 Linux
+- Create a GitHub release with binaries
+- Include the install script in the release
 
 ### Code Style
 
