@@ -10,7 +10,7 @@ use iced::{
     keyboard::{self, Key},
     event::{self, Event as IcedEvent},
     alignment, Padding,
-    window::{self, Level},
+    window::{self, Level, settings::PlatformSpecific},
     Color,
 };
 use std::sync::Arc;
@@ -267,6 +267,13 @@ fn main() -> iced::Result {
             .window(window::Settings {
                 size: iced::Size::new(config.window.width as f32, config.window.height as f32),
                 position: window::Position::Centered,
+                level: Level::AlwaysOnTop,
+                decorations: true,
+                resizable: true,
+                platform_specific: PlatformSpecific {
+                    application_id: "bob-bar".to_string(),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .default_font(Font::MONOSPACE)
@@ -281,6 +288,13 @@ fn run_screenshot_mode(config: config::Config) -> iced::Result {
         .window(window::Settings {
             size: iced::Size::new(config.window.width as f32, config.window.height as f32),
             position: window::Position::Centered,
+            level: Level::AlwaysOnTop,
+            decorations: true,
+            resizable: true,
+            platform_specific: PlatformSpecific {
+                application_id: "bob-bar".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .default_font(Font::MONOSPACE)
@@ -327,7 +341,6 @@ struct App {
     screenshot_mode: bool,
     screenshot_path: Option<std::path::PathBuf>,
     vision_model: String,
-    stream_receiver: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Message>>>>,
 }
 
 impl App {
@@ -414,7 +427,6 @@ impl App {
             screenshot_mode: false,
             screenshot_path: None,
             vision_model,
-            stream_receiver: Arc::new(Mutex::new(None)),
         };
 
         let focus_task = text_input::focus(input_id);
@@ -440,41 +452,32 @@ impl App {
                 self.response_text = String::new();
                 self.streaming_text = String::new();
 
-                // Send start notification
-                let _ = Notification::new()
-                    .summary("bob-bar")
-                    .body("Processing your query...")
-                    .show();
-
-                let client = self.ollama_client.clone();
-                let receiver = self.stream_receiver.clone();
-
-                // Spawn immediately and don't wait
-                tokio::spawn(async move {
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-                    // Store the receiver for the subscription
-                    *receiver.lock().await = Some(rx);
-
-                    // Spawn the streaming task
-                    tokio::spawn(async move {
-                        let mut client = client.lock().await;
-                        let result = client.query_streaming(&prompt, |text| {
-                            let _ = tx.send(Message::StreamingUpdate(text));
-                        }).await;
-
-                        match result {
-                            Ok(response) => {
-                                let _ = tx.send(Message::ResponseReceived(response));
-                            },
-                            Err(e) => {
-                                let _ = tx.send(Message::Error(format!("Error: {}", e)));
-                            },
-                        }
-                    });
+                // Send start notification (fire and forget)
+                std::thread::spawn(|| {
+                    let _ = Notification::new()
+                        .summary("bob-bar")
+                        .body("Processing your query...")
+                        .show();
                 });
 
-                Task::none()
+                let client = self.ollama_client.clone();
+
+                // Use Iced's Task system to run async work non-blocking
+                // This spawns the async work on Iced's tokio runtime thread pool,
+                // keeping the main GUI thread responsive to Wayland events
+                Task::perform(
+                    async move {
+                        let mut client_guard = client.lock().await;
+                        client_guard.query_streaming(&prompt, |_text| {
+                            // For now, we'll skip streaming updates to keep it simple
+                            // We could implement this with a subscription if needed
+                        }).await
+                    },
+                    |result| match result {
+                        Ok(response) => Message::ResponseReceived(response),
+                        Err(e) => Message::Error(format!("Error: {}", e)),
+                    }
+                )
             }
             Message::StreamingUpdate(text) => {
                 self.streaming_text = text;
@@ -485,27 +488,14 @@ impl App {
                 self.streaming_text = String::new();
                 self.is_loading = false;
 
-                // Send completion notification
-                tokio::spawn(async {
-                    let result = Notification::new()
+                // Send completion notification (fire and forget, don't wait for action)
+                std::thread::spawn(|| {
+                    let _ = Notification::new()
                         .summary("bob-bar")
                         .body("Query complete! Click to view results.")
                         .urgency(notify_rust::Urgency::Normal)
                         .timeout(notify_rust::Timeout::Milliseconds(5000))
                         .show();
-
-                    if let Ok(handle) = result {
-                        // Try to wait for click and focus window
-                        tokio::task::spawn_blocking(move || {
-                            handle.wait_for_action(|_action| {
-                                // Any action (including default click) should focus
-                                let _ = std::process::Command::new("sh")
-                                    .arg("-c")
-                                    .arg("wmctrl -a bob-bar || xdotool search --name bob-bar windowactivate")
-                                    .output();
-                            });
-                        });
-                    }
                 });
 
                 // Also request window focus immediately
@@ -520,23 +510,6 @@ impl App {
             Message::Tick => {
                 if self.is_loading {
                     self.loading_frame = (self.loading_frame + 1) % 80; // 10 frames * 8 messages
-
-                    // Check for streaming messages synchronously
-                    let receiver = self.stream_receiver.clone();
-                    return Task::future(async move {
-                        let mut guard = receiver.lock().await;
-                        if let Some(rx) = guard.as_mut() {
-                            // Try to receive all available messages
-                            while let Ok(msg) = rx.try_recv() {
-                                // Return the first non-Tick message
-                                match msg {
-                                    Message::Tick => continue,
-                                    _ => return msg,
-                                }
-                            }
-                        }
-                        Message::Tick
-                    });
                 }
                 Task::none()
             }
@@ -618,7 +591,7 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
 
     fn subscription(&self) -> Subscription<Message> {
         let timer = if self.is_loading {
-            time::every(Duration::from_millis(50)).map(|_| Message::Tick)
+            time::every(Duration::from_millis(200)).map(|_| Message::Tick)
         } else {
             Subscription::none()
         };
