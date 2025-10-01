@@ -3,7 +3,7 @@
 A fast, elegant AI launcher built with Rust and Iced. bob-bar provides instant access to AI assistance through a beautiful, always-on-top interface - think Spotlight or Rofi, but for AI queries.
 
 ![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)
 
 ## Features
 
@@ -13,7 +13,8 @@ A fast, elegant AI launcher built with Rust and Iced. bob-bar provides instant a
 - **🔧 Tool Support** - Extensible tool system with HTTP and MCP protocol support
 - **📋 Copy Output** - One-click copy to clipboard
 - **📸 Screenshot Analysis** - Capture and analyze screenshots with vision models
-- **🎨 Beautiful UI** - Clean, modern interface with smooth animations
+- **🎨 Beautiful UI** - Clean, modern interface with smooth animations and streaming responses
+- **🔔 Desktop Notifications** - Get notified when queries complete
 - **⌨️ Keyboard-First** - ESC to close, enter to submit - stay focused
 
 ## Quick Start
@@ -129,6 +130,11 @@ Screenshot analysis mode:
 bob-bar --screenshot
 ```
 
+Debug mode (shows detailed logging):
+```bash
+bob-bar --debug
+```
+
 Make sure Ollama is running first:
 ```bash
 ollama serve
@@ -141,9 +147,10 @@ ollama pull llama3.2-vision:11b
 
 1. **Launch the app** - bob-bar appears centered on your screen
 2. **Type your question** - The input field is auto-focused
-3. **Get instant answers** - AI responses appear with proper formatting
-4. **Copy results** - Click the [Copy] button to copy output to clipboard
-5. **Close quickly** - Press ESC to dismiss the window
+3. **Watch responses stream** - See AI responses appear in real-time as they're generated
+4. **Desktop notifications** - Get notified when long-running queries complete, even if window is in background
+5. **Copy results** - Click the [Copy] button to copy output to clipboard
+6. **Close quickly** - Press ESC to dismiss the window
 
 ### Screenshot Analysis
 
@@ -300,7 +307,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
