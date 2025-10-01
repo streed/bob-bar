@@ -10,6 +10,7 @@ use std::future::Future;
 use anyhow::Result;
 use futures_util::StreamExt;
 
+#[allow(unused_macros)]
 macro_rules! debug_println {
     ($($arg:tt)*) => {
         if std::env::var("BOBBAR_DEBUG").is_ok() {
@@ -174,7 +175,7 @@ impl OllamaClient {
         Box::pin(self.query_internal::<fn(String)>(prompt, false, None, None))
     }
 
-    async fn query_internal<F>(&mut self, initial_prompt: &str, allow_tools: bool, image: Option<String>, mut callback: Option<&mut F>) -> Result<String>
+    async fn query_internal<F>(&mut self, initial_prompt: &str, allow_tools: bool, image: Option<String>, callback: Option<&mut F>) -> Result<String>
     where
         F: FnMut(String) + Send,
     {

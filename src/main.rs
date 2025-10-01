@@ -29,7 +29,7 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
     let mut in_code_block = false;
     let mut code_block_content = String::new();
     let mut in_bold = false;
-    let mut in_italic = false;
+    let mut _in_italic = false;
     let mut heading_level: Option<HeadingLevel> = None;
     let mut in_list = false;
 
@@ -66,7 +66,7 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                         in_bold = true;
                     }
                     Tag::Emphasis => {
-                        in_italic = true;
+                        _in_italic = true;
                     }
                     Tag::Paragraph => {
                         // Flush text at paragraph start
@@ -155,7 +155,7 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                         in_bold = false;
                     }
                     Tag::Emphasis => {
-                        in_italic = false;
+                        _in_italic = false;
                     }
                     Tag::Paragraph => {
                         if !current_text.is_empty() {
@@ -285,7 +285,7 @@ fn run_screenshot_mode(config: config::Config) -> iced::Result {
         })
         .default_font(Font::MONOSPACE)
         .run_with(|| {
-            let (mut app, mut task) = App::new();
+            let (mut app, task) = App::new();
             app.screenshot_mode = true;
 
             // Capture screenshot after a small delay to allow window to be hidden
@@ -497,7 +497,7 @@ impl App {
                     if let Ok(handle) = result {
                         // Try to wait for click and focus window
                         tokio::task::spawn_blocking(move || {
-                            handle.wait_for_action(|action| {
+                            handle.wait_for_action(|_action| {
                                 // Any action (including default click) should focus
                                 let _ = std::process::Command::new("sh")
                                     .arg("-c")

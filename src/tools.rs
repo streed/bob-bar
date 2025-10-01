@@ -14,6 +14,7 @@ macro_rules! debug_println {
     };
 }
 
+#[allow(unused_macros)]
 macro_rules! debug_eprintln {
     ($($arg:tt)*) => {
         if std::env::var("BOBBAR_DEBUG").is_ok() {
@@ -112,7 +113,7 @@ impl ToolExecutor {
         let api_keys_path = config_dir.join("api_keys.toml");
 
         let api_keys = load_api_keys(&api_keys_path).unwrap_or_else(|e| {
-            edebug_println!("Warning: Failed to load api_keys.toml: {}", e);
+            debug_eprintln!("Warning: Failed to load api_keys.toml: {}", e);
             HashMap::new()
         });
 
@@ -131,7 +132,7 @@ impl ToolExecutor {
             debug_println!("[MCP] Connecting to server: {}", server.name);
             match self.connect_mcp_server(server.clone()).await {
                 Ok(_) => debug_println!("[MCP] ✓ Successfully connected to: {}", server.name),
-                Err(e) => edebug_println!("[MCP] ✗ Failed to connect to {}: {}", server.name, e),
+                Err(e) => debug_eprintln!("[MCP] ✗ Failed to connect to {}: {}", server.name, e),
             }
         }
         Ok(())
@@ -169,7 +170,7 @@ impl ToolExecutor {
             while let Ok(bytes) = stderr_reader.read_line(&mut line).await {
                 if bytes == 0 { break; }
                 if !line.trim().is_empty() {
-                    edebug_println!("[MCP] {} stderr: {}", server_name_clone, line.trim());
+                    debug_eprintln!("[MCP] {} stderr: {}", server_name_clone, line.trim());
                 }
                 line.clear();
             }
