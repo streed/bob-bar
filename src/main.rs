@@ -17,6 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use pulldown_cmark::{Parser, Event as MarkdownEvent, Tag, HeadingLevel};
+use notify_rust::Notification;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
 
 fn render_markdown(markdown: String) -> Element<'static, Message> {
     let parser = Parser::new(&markdown);
@@ -27,6 +31,7 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
     let mut in_bold = false;
     let mut in_italic = false;
     let mut heading_level: Option<HeadingLevel> = None;
+    let mut in_list = false;
 
     for event in parser {
         match event {
@@ -53,6 +58,11 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                         in_code_block = true;
                     }
                     Tag::Strong => {
+                        // Flush text before bold starts
+                        if !current_text.is_empty() {
+                            spans.push(span(current_text.clone()).size(15));
+                            current_text.clear();
+                        }
                         in_bold = true;
                     }
                     Tag::Emphasis => {
@@ -61,7 +71,35 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                     Tag::Paragraph => {
                         // Flush text at paragraph start
                         if !current_text.is_empty() {
-                            spans.push(span(current_text.clone()));
+                            let mut text_span = span(current_text.clone()).size(15);
+                            if in_bold {
+                                text_span = text_span.color(Color::from_rgb(1.0, 1.0, 1.0));
+                            }
+                            spans.push(text_span);
+                            current_text.clear();
+                        }
+                    }
+                    Tag::List(_) => {
+                        // Add spacing before list only if not nested
+                        if !in_list {
+                            if !current_text.is_empty() {
+                                spans.push(span(current_text.clone()));
+                                current_text.clear();
+                            }
+                            if !spans.is_empty() {
+                                spans.push(span("\n"));
+                            }
+                        }
+                        in_list = true;
+                    }
+                    Tag::Item => {
+                        // Flush any pending text
+                        if !current_text.is_empty() {
+                            let mut text_span = span(current_text.clone()).size(15);
+                            if in_bold {
+                                text_span = text_span.color(Color::from_rgb(1.0, 1.0, 1.0));
+                            }
+                            spans.push(text_span);
                             current_text.clear();
                         }
                     }
@@ -105,6 +143,15 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                         in_code_block = false;
                     }
                     Tag::Strong => {
+                        // Flush bold text when exiting bold
+                        if !current_text.is_empty() {
+                            spans.push(
+                                span(current_text.clone())
+                                    .size(15)
+                                    .color(Color::from_rgb(1.0, 1.0, 1.0))
+                            );
+                            current_text.clear();
+                        }
                         in_bold = false;
                     }
                     Tag::Emphasis => {
@@ -119,7 +166,26 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                             spans.push(text_span);
                             current_text.clear();
                         }
-                        spans.push(span("\n\n"));
+                        // Only add newlines if not in a list
+                        if !in_list {
+                            spans.push(span("\n\n"));
+                        }
+                    }
+                    Tag::List(_) => {
+                        // Add spacing after list only for top-level lists
+                        in_list = false;
+                    }
+                    Tag::Item => {
+                        // Add newline after each list item
+                        if !current_text.is_empty() {
+                            let mut text_span = span(current_text.clone()).size(15);
+                            if in_bold {
+                                text_span = text_span.color(Color::from_rgb(1.0, 1.0, 1.0));
+                            }
+                            spans.push(text_span);
+                            current_text.clear();
+                        }
+                        spans.push(span("\n"));
                     }
                     _ => {}
                 }
@@ -179,6 +245,13 @@ fn main() -> iced::Result {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let screenshot_mode = args.iter().any(|arg| arg == "--screenshot" || arg == "-screenshot");
+    let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "-debug");
+
+    // Set debug mode globally
+    DEBUG_MODE.store(debug_mode, Ordering::Relaxed);
+    if debug_mode {
+        std::env::set_var("BOBBAR_DEBUG", "1");
+    }
 
     // Get screen dimensions to calculate center
     let config = config::Config::load();
@@ -235,6 +308,7 @@ enum Message {
     InputChanged(String),
     Submit,
     ResponseReceived(String),
+    StreamingUpdate(String),
     Error(String),
     Tick,
     CopyOutput,
@@ -245,6 +319,7 @@ enum Message {
 struct App {
     input_text: String,
     response_text: String,
+    streaming_text: String,
     is_loading: bool,
     loading_frame: usize,
     ollama_client: Arc<Mutex<ollama::OllamaClient>>,
@@ -252,6 +327,7 @@ struct App {
     screenshot_mode: bool,
     screenshot_path: Option<std::path::PathBuf>,
     vision_model: String,
+    stream_receiver: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Message>>>>,
 }
 
 impl App {
@@ -264,6 +340,29 @@ impl App {
         let tool_executor = if tools_path.exists() {
             match tools::ToolExecutor::from_file(&tools_path) {
                 Ok(executor) => {
+                    // Print tool configuration on startup (only in debug mode)
+                    if DEBUG_MODE.load(Ordering::Relaxed) {
+                        eprintln!("=== Tool Configuration ===");
+                        eprintln!("Loaded from: {}", tools_path.display());
+
+                        // Print HTTP tools
+                        if !executor.config.tools.http.is_empty() {
+                            eprintln!("\nHTTP Tools ({}):", executor.config.tools.http.len());
+                            for tool in &executor.config.tools.http {
+                                eprintln!("  • {} - {}", tool.name, tool.description);
+                            }
+                        }
+
+                        // Print MCP tools
+                        if !executor.config.tools.mcp.is_empty() {
+                            eprintln!("\nMCP Servers ({}):", executor.config.tools.mcp.len());
+                            for server in &executor.config.tools.mcp {
+                                eprintln!("  • {} - {}", server.name, server.command);
+                            }
+                        }
+                        eprintln!("==========================\n");
+                    }
+
                     let executor_arc = Arc::new(Mutex::new(executor));
 
                     // Initialize MCP servers in background
@@ -307,6 +406,7 @@ impl App {
         let app = App {
             input_text: String::new(),
             response_text: String::new(),
+            streaming_text: String::new(),
             is_loading: false,
             loading_frame: 0,
             ollama_client: Arc::new(Mutex::new(ollama_client)),
@@ -314,6 +414,7 @@ impl App {
             screenshot_mode: false,
             screenshot_path: None,
             vision_model,
+            stream_receiver: Arc::new(Mutex::new(None)),
         };
 
         let focus_task = text_input::focus(input_id);
@@ -337,32 +438,105 @@ impl App {
                 let prompt = self.input_text.clone();
                 self.is_loading = true;
                 self.response_text = String::new();
+                self.streaming_text = String::new();
+
+                // Send start notification
+                let _ = Notification::new()
+                    .summary("bob-bar")
+                    .body("Processing your query...")
+                    .show();
 
                 let client = self.ollama_client.clone();
+                let receiver = self.stream_receiver.clone();
 
-                Task::future(async move {
-                    let mut client = client.lock().await;
-                    let result = client.query(&prompt).await;
+                // Spawn immediately and don't wait
+                tokio::spawn(async move {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-                    match result {
-                        Ok(response) => Message::ResponseReceived(response),
-                        Err(e) => Message::Error(format!("Error: {}", e)),
-                    }
-                })
+                    // Store the receiver for the subscription
+                    *receiver.lock().await = Some(rx);
+
+                    // Spawn the streaming task
+                    tokio::spawn(async move {
+                        let mut client = client.lock().await;
+                        let result = client.query_streaming(&prompt, |text| {
+                            let _ = tx.send(Message::StreamingUpdate(text));
+                        }).await;
+
+                        match result {
+                            Ok(response) => {
+                                let _ = tx.send(Message::ResponseReceived(response));
+                            },
+                            Err(e) => {
+                                let _ = tx.send(Message::Error(format!("Error: {}", e)));
+                            },
+                        }
+                    });
+                });
+
+                Task::none()
+            }
+            Message::StreamingUpdate(text) => {
+                self.streaming_text = text;
+                Task::none()
             }
             Message::ResponseReceived(response) => {
                 self.response_text = response;
+                self.streaming_text = String::new();
                 self.is_loading = false;
-                Task::none()
+
+                // Send completion notification
+                tokio::spawn(async {
+                    let result = Notification::new()
+                        .summary("bob-bar")
+                        .body("Query complete! Click to view results.")
+                        .urgency(notify_rust::Urgency::Normal)
+                        .timeout(notify_rust::Timeout::Milliseconds(5000))
+                        .show();
+
+                    if let Ok(handle) = result {
+                        // Try to wait for click and focus window
+                        tokio::task::spawn_blocking(move || {
+                            handle.wait_for_action(|action| {
+                                // Any action (including default click) should focus
+                                let _ = std::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg("wmctrl -a bob-bar || xdotool search --name bob-bar windowactivate")
+                                    .output();
+                            });
+                        });
+                    }
+                });
+
+                // Also request window focus immediately
+                window::get_latest().and_then(|id| window::gain_focus(id))
             }
             Message::Error(error) => {
                 self.response_text = error;
+                self.streaming_text = String::new();
                 self.is_loading = false;
                 Task::none()
             }
             Message::Tick => {
                 if self.is_loading {
                     self.loading_frame = (self.loading_frame + 1) % 80; // 10 frames * 8 messages
+
+                    // Check for streaming messages synchronously
+                    let receiver = self.stream_receiver.clone();
+                    return Task::future(async move {
+                        let mut guard = receiver.lock().await;
+                        if let Some(rx) = guard.as_mut() {
+                            // Try to receive all available messages
+                            while let Ok(msg) = rx.try_recv() {
+                                // Return the first non-Tick message
+                                match msg {
+                                    Message::Tick => continue,
+                                    _ => return msg,
+                                }
+                            }
+                        }
+                        Message::Tick
+                    });
                 }
                 Task::none()
             }
@@ -444,7 +618,7 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
 
     fn subscription(&self) -> Subscription<Message> {
         let timer = if self.is_loading {
-            time::every(Duration::from_millis(80)).map(|_| Message::Tick)
+            time::every(Duration::from_millis(50)).map(|_| Message::Tick)
         } else {
             Subscription::none()
         };
@@ -478,50 +652,61 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
         }
 
         let output: Element<Message> = if self.is_loading {
-            // Show animated loading text with fun messages using unicode spinner
-            let loading_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let loading_messages = if self.screenshot_mode {
-                [
-                    "Reading visible text...",
-                    "Extracting exact content...",
-                    "Transcribing screen elements...",
-                    "Identifying visible information...",
-                    "Processing text and data...",
-                    "Analyzing visible content...",
-                    "Extracting concrete information...",
-                    "Reading screen accurately...",
-                ]
+            // Show streaming text if available, otherwise show loading spinner
+            if !self.streaming_text.is_empty() {
+                scrollable(
+                    container(render_markdown(self.streaming_text.clone()))
+                        .padding(15)
+                        .width(Length::Fill)
+                )
+                .height(Length::Fill)
+                .into()
             } else {
-                [
-                    "Consulting the digital oracle...",
-                    "Summoning AI wisdom...",
-                    "Asking the machines nicely...",
-                    "Brewing up an answer...",
-                    "Thinking really hard...",
-                    "Channeling silicon spirits...",
-                    "Calculating probabilities...",
-                    "Parsing the universe...",
-                ]
-            };
+                // Show animated loading text with fun messages using unicode spinner
+                let loading_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let loading_messages = if self.screenshot_mode {
+                    [
+                        "Reading visible text...",
+                        "Extracting exact content...",
+                        "Transcribing screen elements...",
+                        "Identifying visible information...",
+                        "Processing text and data...",
+                        "Analyzing visible content...",
+                        "Extracting concrete information...",
+                        "Reading screen accurately...",
+                    ]
+                } else {
+                    [
+                        "Consulting the digital oracle...",
+                        "Summoning AI wisdom...",
+                        "Asking the machines nicely...",
+                        "Brewing up an answer...",
+                        "Thinking really hard...",
+                        "Channeling silicon spirits...",
+                        "Calculating probabilities...",
+                        "Parsing the universe...",
+                    ]
+                };
 
-            let message_idx = (self.loading_frame / 10) % loading_messages.len();
-            let spinner_idx = self.loading_frame % loading_frames.len();
+                let message_idx = (self.loading_frame / 10) % loading_messages.len();
+                let spinner_idx = self.loading_frame % loading_frames.len();
 
-            container(
-                column![
-                    text(loading_frames[spinner_idx])
-                        .size(32),
-                    text(loading_messages[message_idx])
-                        .size(15)
-                ]
-                .spacing(10)
+                container(
+                    column![
+                        text(loading_frames[spinner_idx])
+                            .size(32),
+                        text(loading_messages[message_idx])
+                            .size(15)
+                    ]
+                    .spacing(10)
+                    .align_x(alignment::Horizontal::Center)
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
                 .align_x(alignment::Horizontal::Center)
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(alignment::Horizontal::Center)
-            .align_y(alignment::Vertical::Center)
-            .into()
+                .align_y(alignment::Vertical::Center)
+                .into()
+            }
         } else {
             scrollable(
                 container(render_markdown(self.response_text.clone()))

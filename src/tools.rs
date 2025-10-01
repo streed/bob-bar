@@ -6,6 +6,22 @@ use tokio::process::Command;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use toml;
 
+macro_rules! debug_println {
+    ($($arg:tt)*) => {
+        if std::env::var("BOBBAR_DEBUG").is_ok() {
+            println!($($arg)*);
+        }
+    };
+}
+
+macro_rules! debug_eprintln {
+    ($($arg:tt)*) => {
+        if std::env::var("BOBBAR_DEBUG").is_ok() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolsConfig {
     pub tools: Tools,
@@ -96,7 +112,7 @@ impl ToolExecutor {
         let api_keys_path = config_dir.join("api_keys.toml");
 
         let api_keys = load_api_keys(&api_keys_path).unwrap_or_else(|e| {
-            eprintln!("Warning: Failed to load api_keys.toml: {}", e);
+            edebug_println!("Warning: Failed to load api_keys.toml: {}", e);
             HashMap::new()
         });
 
@@ -106,16 +122,16 @@ impl ToolExecutor {
     pub async fn initialize_mcp_servers(&mut self) -> Result<(), anyhow::Error> {
         let servers = self.config.tools.mcp.clone();
         if servers.is_empty() {
-            println!("[MCP] No MCP servers configured");
+            debug_println!("[MCP] No MCP servers configured");
             return Ok(());
         }
 
-        println!("[MCP] Initializing {} MCP servers...", servers.len());
+        debug_println!("[MCP] Initializing {} MCP servers...", servers.len());
         for server in servers {
-            println!("[MCP] Connecting to server: {}", server.name);
+            debug_println!("[MCP] Connecting to server: {}", server.name);
             match self.connect_mcp_server(server.clone()).await {
-                Ok(_) => println!("[MCP] ✓ Successfully connected to: {}", server.name),
-                Err(e) => eprintln!("[MCP] ✗ Failed to connect to {}: {}", server.name, e),
+                Ok(_) => debug_println!("[MCP] ✓ Successfully connected to: {}", server.name),
+                Err(e) => edebug_println!("[MCP] ✗ Failed to connect to {}: {}", server.name, e),
             }
         }
         Ok(())
@@ -126,7 +142,7 @@ impl ToolExecutor {
             return Err(anyhow::anyhow!("Unsupported transport: {}", server.transport));
         }
 
-        println!("[MCP] Starting process: {} {:?}", server.command, server.args);
+        debug_println!("[MCP] Starting process: {} {:?}", server.command, server.args);
         let mut cmd = Command::new(&server.command);
         cmd.args(&server.args)
             .stdin(Stdio::piped())
@@ -134,12 +150,12 @@ impl ToolExecutor {
             .stderr(Stdio::piped());  // Capture stderr for debugging
 
         for (key, value) in &server.env {
-            println!("[MCP] Setting env var: {}=***", key);
+            debug_println!("[MCP] Setting env var: {}=***", key);
             cmd.env(key, value);
         }
 
         let mut process = cmd.spawn()?;
-        println!("[MCP] Process spawned for: {}", server.name);
+        debug_println!("[MCP] Process spawned for: {}", server.name);
         let stdin = process.stdin.take().ok_or_else(|| anyhow::anyhow!("Failed to get stdin"))?;
         let stdout = process.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to get stdout"))?;
         let stderr = process.stderr.take().ok_or_else(|| anyhow::anyhow!("Failed to get stderr"))?;
@@ -153,7 +169,7 @@ impl ToolExecutor {
             while let Ok(bytes) = stderr_reader.read_line(&mut line).await {
                 if bytes == 0 { break; }
                 if !line.trim().is_empty() {
-                    eprintln!("[MCP] {} stderr: {}", server_name_clone, line.trim());
+                    edebug_println!("[MCP] {} stderr: {}", server_name_clone, line.trim());
                 }
                 line.clear();
             }
@@ -191,7 +207,7 @@ impl ToolExecutor {
         self.send_mcp_message(server_name, &init_message).await?;
         // Read and process the response
         let init_response = self.read_mcp_response(server_name).await?;
-        println!("[MCP] Initialize response: {:?}", init_response);
+        debug_println!("[MCP] Initialize response: {:?}", init_response);
 
         // Now request the list of tools
         let list_tools_message = json!({
@@ -201,7 +217,7 @@ impl ToolExecutor {
             "id": 2
         });
 
-        println!("[MCP] Requesting tool list from {}", server_name);
+        debug_println!("[MCP] Requesting tool list from {}", server_name);
         self.send_mcp_message(server_name, &list_tools_message).await?;
         let tools_response = self.read_mcp_response(server_name).await?;
 
@@ -209,13 +225,13 @@ impl ToolExecutor {
         if let Some(result) = tools_response.get("result") {
             if let Some(tools_array) = result.get("tools") {
                 if let Ok(tools) = serde_json::from_value::<Vec<McpTool>>(tools_array.clone()) {
-                    println!("[MCP] {} tools discovered from {}:", tools.len(), server_name);
+                    debug_println!("[MCP] {} tools discovered from {}:", tools.len(), server_name);
                     for tool in &tools {
-                        println!("[MCP]   • {}: {}", tool.name, tool.description.as_ref().unwrap_or(&"No description".to_string()));
+                        debug_println!("[MCP]   • {}: {}", tool.name, tool.description.as_ref().unwrap_or(&"No description".to_string()));
                     }
                     self.mcp_tools.insert(server_name.to_string(), tools);
                 } else {
-                    println!("[MCP] Failed to parse tools from response");
+                    debug_println!("[MCP] Failed to parse tools from response");
                 }
             }
         }
@@ -224,7 +240,7 @@ impl ToolExecutor {
     }
 
     async fn send_mcp_message(&mut self, server_name: &str, message: &Value) -> Result<(), anyhow::Error> {
-        println!("[MCP] Sending message to {}: {}", server_name, message);
+        debug_println!("[MCP] Sending message to {}: {}", server_name, message);
         let connection = self.mcp_connections.get_mut(server_name)
             .ok_or_else(|| anyhow::anyhow!("MCP server {} not connected", server_name))?;
 
@@ -232,13 +248,13 @@ impl ToolExecutor {
         connection.stdin.write_all(msg_str.as_bytes()).await?;
         connection.stdin.write_all(b"\n").await?;
         connection.stdin.flush().await?;
-        println!("[MCP] Message sent to: {}", server_name);
+        debug_println!("[MCP] Message sent to: {}", server_name);
 
         Ok(())
     }
 
     async fn read_mcp_response(&mut self, server_name: &str) -> Result<Value, anyhow::Error> {
-        println!("[MCP] Reading response from: {}", server_name);
+        debug_println!("[MCP] Reading response from: {}", server_name);
         let connection = self.mcp_connections.get_mut(server_name)
             .ok_or_else(|| anyhow::anyhow!("MCP server {} not connected", server_name))?;
 
@@ -258,7 +274,7 @@ impl ToolExecutor {
                 continue;
             }
 
-            println!("[MCP] Raw response from {}: {}", server_name,
+            debug_println!("[MCP] Raw response from {}: {}", server_name,
                 if trimmed.len() > 200 {
                     format!("{}...", &trimmed[..200])
                 } else {
@@ -268,20 +284,20 @@ impl ToolExecutor {
             // Try to parse as JSON
             match serde_json::from_str::<Value>(trimmed) {
                 Ok(response) => {
-                    println!("[MCP] Successfully parsed JSON response");
+                    debug_println!("[MCP] Successfully parsed JSON response");
                     return Ok(response);
                 },
                 Err(e) => {
                     // If it's not JSON, it might be debug output
                     if trimmed.starts_with('{') || trimmed.starts_with('[') {
                         // Looks like JSON but failed to parse
-                        println!("[MCP] Failed to parse JSON: {}", e);
+                        debug_println!("[MCP] Failed to parse JSON: {}", e);
                         if attempts > 5 {
                             return Err(anyhow::anyhow!("Failed to parse JSON response after retries"));
                         }
                     } else {
                         // Probably debug output, skip it
-                        println!("[MCP] Skipping non-JSON output: {}", trimmed);
+                        debug_println!("[MCP] Skipping non-JSON output: {}", trimmed);
                     }
                 }
             }
@@ -294,7 +310,7 @@ impl ToolExecutor {
     }
 
     fn extract_json_path(&self, json: &Value, path: &str) -> Result<Value, anyhow::Error> {
-        println!("[JSON] Extracting path: {} from response", path);
+        debug_println!("[JSON] Extracting path: {} from response", path);
 
         let mut current = json.clone();
         let parts: Vec<&str> = path.split('.').collect();
@@ -332,7 +348,7 @@ impl ToolExecutor {
             }
         }
 
-        println!("[JSON] Successfully extracted value from path: {}", path);
+        debug_println!("[JSON] Successfully extracted value from path: {}", path);
         Ok(current)
     }
 
@@ -380,7 +396,7 @@ impl ToolExecutor {
     pub async fn execute_http_tool(&self, tool_name: &str, params: HashMap<String, String>)
         -> Result<Value, anyhow::Error> {
 
-        println!("[HTTP] Executing tool: {} with params: {:?}", tool_name, params);
+        debug_println!("[HTTP] Executing tool: {} with params: {:?}", tool_name, params);
         let tool = self.config.tools.http.iter()
             .find(|t| t.name == tool_name)
             .ok_or_else(|| anyhow::anyhow!("HTTP tool '{}' not found", tool_name))?;
@@ -434,17 +450,17 @@ impl ToolExecutor {
         // Replace {param_name} and :param_name placeholders in the URL
         for param_name in &tool.path_params {
             if let Some(value) = path_param_values.get(param_name) {
-                println!("[HTTP] Replacing path parameter '{}' with: {}", param_name, value);
+                debug_println!("[HTTP] Replacing path parameter '{}' with: {}", param_name, value);
                 // Support both {param} and :param styles
                 final_endpoint = final_endpoint
                     .replace(&format!("{{{}}}", param_name), value)
                     .replace(&format!(":{}", param_name), value);
             } else if tool.parameters.get(param_name).map_or(false, |p| p.required) {
-                println!("[HTTP] Warning: Required path parameter {} not found", param_name);
+                debug_println!("[HTTP] Warning: Required path parameter {} not found", param_name);
             }
         }
 
-        println!("[HTTP] Final endpoint after path substitution: {}", final_endpoint);
+        debug_println!("[HTTP] Final endpoint after path substitution: {}", final_endpoint);
 
         // Process headers with environment variable substitution
         let mut request_builder = match tool.method.as_str() {
@@ -458,40 +474,24 @@ impl ToolExecutor {
 
         // Add headers with variable substitution
         for (header_name, header_value) in &tool.headers {
-            println!("[HTTP] Processing header: {} with value: {}", header_name, header_value);
-
             let processed_value = if header_value.contains("${") {
                 // Process environment variable substitution
                 let mut value = header_value.clone();
-                println!("[HTTP] Found variable in header value, starting substitution...");
 
                 // Find all ${VAR_NAME} patterns and replace them
                 while let Some(start) = value.find("${") {
                     if let Some(end) = value[start..].find('}') {
                         let var_name = &value[start + 2..start + end];
-                        println!("[HTTP] Looking for variable: {}", var_name);
 
                         // Try api_keys first
                         let replacement = if let Some(api_key) = self.api_keys.get(var_name) {
-                            println!("[HTTP] Found {} in api_keys.toml", var_name);
                             api_key.clone()
                         } else if let Ok(env_val) = std::env::var(var_name) {
-                            println!("[HTTP] Found {} in environment variables", var_name);
                             env_val
                         } else {
-                            println!("[HTTP] Warning: Variable {} not found in api_keys.toml or environment", var_name);
                             format!("${{{}}}", var_name)
                         };
 
-                        // Mask sensitive values in logs
-                        let log_replacement = if var_name.contains("KEY") || var_name.contains("TOKEN") || var_name.contains("SECRET") {
-                            "***MASKED***".to_string()
-                        } else if replacement.len() > 20 {
-                            format!("{}...", &replacement[..20])
-                        } else {
-                            replacement.clone()
-                        };
-                        println!("[HTTP] Replacing ${{{0}}} with: {1}", var_name, log_replacement);
                         value.replace_range(start..=start + end, &replacement);
                     } else {
                         break;
@@ -499,24 +499,13 @@ impl ToolExecutor {
                 }
                 value
             } else {
-                println!("[HTTP] No variables to substitute in header value");
                 header_value.clone()
             };
 
-            // Mask sensitive headers in logs
-            let log_value = if header_name.to_lowercase().contains("auth")
-                || header_name.to_lowercase().contains("key")
-                || header_name.to_lowercase().contains("token") {
-                "***MASKED***".to_string()
-            } else {
-                processed_value.clone()
-            };
-
-            println!("[HTTP] Setting header: {} = {}", header_name, log_value);
             request_builder = request_builder.header(header_name, processed_value);
         }
 
-        println!("[HTTP] Making {} request to: {}", tool.method, tool.endpoint);
+        debug_println!("[HTTP] Making {} request to: {}", tool.method, tool.endpoint);
 
         // Add query parameters or JSON body based on method
         let response = match tool.method.as_str() {
@@ -533,14 +522,14 @@ impl ToolExecutor {
                         (k.clone(), string_value)
                     })
                     .collect();
-                println!("[HTTP] Adding query parameters: {:?}", query_params);
+                debug_println!("[HTTP] Adding query parameters: {:?}", query_params);
                 request_builder
                     .query(&query_params)
                     .send()
                     .await?
             },
             "POST" => {
-                println!("[HTTP] Sending JSON body: {:?}", final_params);
+                debug_println!("[HTTP] Sending JSON body: {:?}", final_params);
                 request_builder
                     .json(&final_params)
                     .send()
@@ -549,12 +538,12 @@ impl ToolExecutor {
             _ => unreachable!(),
         };
 
-        println!("[HTTP] Response status: {}", response.status());
+        debug_println!("[HTTP] Response status: {}", response.status());
 
         if !response.status().is_success() {
             let status = response.status();
             let error_body = response.text().await.unwrap_or_else(|_| "Could not read error response".to_string());
-            println!("[HTTP] Error response body: {}", error_body);
+            debug_println!("[HTTP] Error response body: {}", error_body);
             return Err(anyhow::anyhow!("HTTP {} error: {}", status, error_body));
         }
 
@@ -568,14 +557,14 @@ impl ToolExecutor {
             result = self.extract_json_path(&result, path)?;
         }
 
-        println!("[HTTP] Tool {} executed successfully", tool_name);
+        debug_println!("[HTTP] Tool {} executed successfully", tool_name);
         Ok(result)
     }
 
     pub async fn execute_mcp_tool(&mut self, server_name: &str, tool_name: &str, params: Value)
         -> Result<Value, anyhow::Error> {
 
-        println!("[MCP] Executing tool '{}' on server: {}", tool_name, server_name);
+        debug_println!("[MCP] Executing tool '{}' on server: {}", tool_name, server_name);
 
         // MCP tools are called with tools/call method
         let message = json!({
@@ -590,7 +579,7 @@ impl ToolExecutor {
 
         self.send_mcp_message(server_name, &message).await?;
         let response = self.read_mcp_response(server_name).await?;
-        println!("[MCP] Tool execution completed for: {}", server_name);
+        debug_println!("[MCP] Tool execution completed for: {}", server_name);
 
         // Extract the result from the response
         if let Some(result) = response.get("result") {
@@ -655,12 +644,12 @@ pub struct ParameterDescription {
 }
 
 pub fn load_tools_config(path: &str) -> Result<ToolsConfig, anyhow::Error> {
-    println!("[TOOLS] Loading tools configuration from: {}", path);
+    debug_println!("[TOOLS] Loading tools configuration from: {}", path);
     let contents = std::fs::read_to_string(path)?;
 
     // Handle empty or invalid JSON files
     if contents.trim().is_empty() {
-        println!("[TOOLS] Configuration file is empty");
+        debug_println!("[TOOLS] Configuration file is empty");
         return Ok(ToolsConfig {
             tools: Tools {
                 http: Vec::new(),
@@ -672,7 +661,7 @@ pub fn load_tools_config(path: &str) -> Result<ToolsConfig, anyhow::Error> {
     let config: ToolsConfig = serde_json::from_str(&contents)
         .map_err(|e| anyhow::anyhow!("Failed to parse tools.json: {}", e))?;
 
-    println!("[TOOLS] Successfully loaded {} HTTP tools and {} MCP servers",
+    debug_println!("[TOOLS] Successfully loaded {} HTTP tools and {} MCP servers",
         config.tools.http.len(),
         config.tools.mcp.len());
 
