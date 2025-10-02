@@ -110,10 +110,13 @@ struct OllamaChatResponse {
 
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
+    #[allow(dead_code)]
     role: String,
     content: String,
+    #[allow(dead_code)]
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
+    #[allow(dead_code)]
     #[serde(default)]
     thinking: Option<String>,
 }
@@ -154,6 +157,7 @@ impl OllamaClient {
         &self.model
     }
 
+    #[allow(dead_code)]
     pub async fn query(&mut self, prompt: &str) -> Result<String> {
         self.query_internal::<fn(String)>(prompt, true, None, None).await
     }
@@ -169,6 +173,7 @@ impl OllamaClient {
         self.query_internal::<fn(String)>(prompt, false, Some(base64_image.to_string()), None).await
     }
 
+    #[allow(dead_code)]
     fn query_without_tools<'a>(&'a mut self, prompt: &'a str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(self.query_internal::<fn(String)>(prompt, false, None, None))
     }
@@ -528,6 +533,7 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
         }
     }
 
+    #[allow(dead_code)]
     async fn execute_tool_call(&mut self, tool_call: Value, executor: Arc<Mutex<crate::tools::ToolExecutor>>)
         -> Result<String> {
 

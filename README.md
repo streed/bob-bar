@@ -16,6 +16,7 @@ A fast, elegant AI launcher built with Rust and Iced. bob-bar provides instant a
 - **🎨 Beautiful UI** - Clean, modern interface with smooth animations and streaming responses
 - **🔔 Desktop Notifications** - Get notified when queries complete
 - **⌨️ Keyboard-First** - ESC to close, enter to submit - stay focused
+- **🗂 History Sidebar** - Browse previous queries and outputs; stored locally in SQLite
 
 ## Quick Start
 
@@ -26,17 +27,28 @@ A fast, elegant AI launcher built with Rust and Iced. bob-bar provides instant a
 
 ### Installation
 
-**Quick Install (Linux)**
+**Quick Install (Linux/macOS, builds from source)**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/streed/bob-bar/main/install.sh | bash
 ```
 
+Requirements:
+- `git` and Rust (`cargo`) installed. Install Rust from https://rustup.rs
+
 The install script will:
-- Download the latest release for your architecture (x86_64 or aarch64)
+- Clone the repository and build a native binary for your machine
 - Install bob-bar to `~/.local/bin/bob-bar`
 - Create default configuration files in `~/.config/bob-bar/`
-- Check for required dependencies
+- On macOS: create a double‑clickable app at `~/Applications/Bob Bar.app`
+- On Linux: create a launcher at `~/.local/share/applications/bob-bar.desktop`
+
+Icon behavior
+- Default branded icon: included at `packaging/icons/bob-bar.svg`. The installer converts it to PNG when `rsvg-convert`, `inkscape`, or ImageMagick `convert` is available.
+- Custom icon: provide `BOB_BAR_ICON=/path/to/icon.png` when running the installer to override the default.
+- macOS: if `sips` and `iconutil` are available, the installer generates an `.icns` and embeds it in the app bundle.
+- Linux: the icon is installed under `~/.local/share/icons/hicolor/...` and the launcher uses it (`Icon=bob-bar`).
+- No converters available: falls back to a minimal placeholder PNG, so the app still has an icon.
 
 **Manual Installation**
 
@@ -171,7 +183,8 @@ ollama pull llama3.2-vision:11b
 3. **Watch responses stream** - See AI responses appear in real-time as they're generated
 4. **Desktop notifications** - Get notified when long-running queries complete, even if window is in background
 5. **Copy results** - Click the [Copy] button to copy output to clipboard
-6. **Close quickly** - Press ESC to dismiss the window
+6. **Browse history** - Use the left sidebar to load previous queries/answers
+7. **Close quickly** - Press ESC to dismiss the window
 
 ### Screenshot Analysis
 
@@ -221,6 +234,7 @@ bob-bar/
 │   ├── ollama.rs    # Ollama API client
 │   ├── tools.rs     # Tool execution system
 │   └── config.rs    # Configuration management
+│   └── history.rs   # SQLite-backed query/response history
 ├── config.example.toml      # Example configuration
 ├── api_keys.example.toml    # Example API keys
 └── tools.example.json       # Example tool definitions
@@ -228,7 +242,8 @@ bob-bar/
 ~/.config/bob-bar/           # User configuration directory
 ├── config.toml              # Main configuration
 ├── api_keys.toml            # API keys (not in repo)
-└── tools.json               # Tool definitions (optional)
+├── tools.json               # Tool definitions (optional)
+└── history.sqlite           # Local history database (auto-created)
 ```
 
 ## Development

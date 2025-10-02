@@ -72,6 +72,7 @@ pub struct McpServer {
 
 #[derive(Debug)]
 pub struct McpConnection {
+    #[allow(dead_code)]
     process: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
     stdout: BufReader<tokio::process::ChildStdout>,
@@ -644,6 +645,7 @@ pub struct ParameterDescription {
     pub required: bool,
 }
 
+#[allow(dead_code)]
 pub fn load_tools_config(path: &str) -> Result<ToolsConfig, anyhow::Error> {
     debug_println!("[TOOLS] Loading tools configuration from: {}", path);
     let contents = std::fs::read_to_string(path)?;

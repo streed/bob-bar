@@ -1,12 +1,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod config;
+mod history;
 mod ollama;
 mod tools;
 mod screenshot;
 
 use iced::{
-    widget::{column, container, scrollable, text, text_input, button, text_input::Id, rich_text, span},
+    widget::{column, row, container, scrollable, text, text_input, button, text_input::Id, rich_text, span, text_editor, Space},
     Element, Length, Task, Theme, Font, Subscription,
     time, clipboard,
     keyboard::{self, Key},
@@ -20,9 +21,15 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use pulldown_cmark::{Parser, Event as MarkdownEvent, Tag, HeadingLevel, Options, Alignment};
 use notify_rust::Notification;
+use iced::widget::scrollable::{Direction, Scrollbar};
 use std::sync::atomic::{AtomicBool, Ordering};
+use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
 
 static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
+const ENABLE_NOTIFICATIONS: bool = false;
+const TABLE_MAX_COL_WIDTH: usize = 80; // clamp overly wide columns to reduce horizontal scrolling
+const INPUT_HEIGHT: f32 = 48.0; // approximate height to align sidebar header with input
+const TABLE_PLAIN_TEXT_RULES: &str = "When including Markdown tables in your response: 1) do not apply any styling (no bold, italics, code formatting) to table headers or table cell values; 2) do not use Unicode symbols or emoji inside any table cells — use plain ASCII text only (letters, numbers, basic punctuation).";
 
 fn render_markdown(markdown: String) -> Element<'static, Message> {
     let mut md_options = Options::empty();
@@ -30,7 +37,7 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
     let parser = Parser::new_ext(&markdown, md_options);
     let mut spans = Vec::new();
     let mut blocks: Vec<Element<'static, Message>> = Vec::new();
-    let mut flush_spans = |spans: &mut Vec<_>, blocks: &mut Vec<Element<'static, Message>>| {
+    let flush_spans = |spans: &mut Vec<_>, blocks: &mut Vec<Element<'static, Message>>| {
         if !spans.is_empty() {
             blocks.push(rich_text(spans.clone()).into());
             spans.clear();
@@ -160,7 +167,7 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                             current_row.clear();
                         }
 
-                        // Build a monospaced table rendering
+                        // Build a monospaced table rendering (bordered)
                         let mut rows = Vec::new();
                         rows.extend(header_rows.iter().cloned());
                         rows.extend(body_rows.iter().cloned());
@@ -169,16 +176,16 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                         let mut col_widths = vec![0usize; cols];
                         for r in &rows {
                             for (i, cell) in r.iter().enumerate() {
-                                col_widths[i] = col_widths[i].max(cell.chars().count());
+                                let len = UnicodeWidthStr::width(cell.as_str()).min(TABLE_MAX_COL_WIDTH);
+                                col_widths[i] = col_widths[i].max(len);
                             }
                         }
-                        // Use uniform column width so all columns align evenly.
-                        // Each column will be as wide as the longest column.
-                        let uniform_width = col_widths.iter().copied().max().unwrap_or(0);
-                        let eff_widths = if cols > 0 { vec![uniform_width; cols] } else { Vec::new() };
+                        let eff_widths = col_widths.clone();
+
+                        const CELL_PAD: usize = 1;
 
                         let pad_cell = |s: &str, width: usize, align: Alignment| -> String {
-                            let len = s.chars().count();
+                            let len = UnicodeWidthStr::width(s);
                             if len >= width { return s.to_string(); }
                             let pad = width - len;
                             match align {
@@ -192,12 +199,11 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                             }
                         };
 
-                        // Build Unicode box-drawn borders
                         let make_border = |left: char, mid: char, right: char, horiz: char| {
                             let mut s = String::new();
                             s.push(left);
                             for i in 0..cols {
-                                let seg = eff_widths[i] + 2; // account for padding spaces
+                                let seg = eff_widths[i] + CELL_PAD * 2;
                                 for _ in 0..seg.max(3) { s.push(horiz); }
                                 if i + 1 < cols { s.push(mid); } else { s.push(right); }
                             }
@@ -209,20 +215,36 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                         let row_sep = make_border('├', '┼', '┤', '─');
                         let bottom_border = make_border('└', '┴', '┘', '─');
 
-                        // Build table as styled lines
+                        let truncate_to = |s: &str, width: usize| -> String {
+                            let w = UnicodeWidthStr::width(s);
+                            if w <= width { return s.to_string(); }
+                            if width == 0 { return String::new(); }
+                            let target = width.saturating_sub(1);
+                            let mut acc = String::new();
+                            let mut used = 0usize;
+                            for ch in s.chars() {
+                                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                                if used + cw > target { break; }
+                                acc.push(ch);
+                                used += cw;
+                            }
+                            acc.push('…');
+                            acc
+                        };
+
                         let mut table_lines: Vec<(String, &'static str)> = Vec::new();
 
-                        // Header section
                         table_lines.push((top_border.clone(), "border"));
                         for r in &header_rows {
                             let mut line = String::new();
                             line.push('│');
                             for i in 0..cols {
-                                let s = r.get(i).map(|s| s.as_str()).unwrap_or("");
+                                let raw = r.get(i).map(|s| s.as_str()).unwrap_or("");
+                                let s = truncate_to(raw, eff_widths[i]);
                                 let align = table_alignments.get(i).cloned().unwrap_or(Alignment::Left);
-                                line.push(' ');
-                                line.push_str(&pad_cell(s, eff_widths[i], align));
-                                line.push(' ');
+                                for _ in 0..CELL_PAD { line.push(' '); }
+                                line.push_str(&pad_cell(&s, eff_widths[i], align));
+                                for _ in 0..CELL_PAD { line.push(' '); }
                                 line.push('│');
                             }
                             table_lines.push((line, "header"));
@@ -232,53 +254,39 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                             table_lines.push((header_sep.clone(), "border-strong"));
                         }
 
-                        // Body rows (with separators between rows)
                         for (idx, r) in body_rows.iter().enumerate() {
                             let mut line = String::new();
                             line.push('│');
                             for i in 0..cols {
-                                let s = r.get(i).map(|s| s.as_str()).unwrap_or("");
+                                let raw = r.get(i).map(|s| s.as_str()).unwrap_or("");
+                                let s = truncate_to(raw, eff_widths[i]);
                                 let align = table_alignments.get(i).cloned().unwrap_or(Alignment::Left);
-                                line.push(' ');
-                                line.push_str(&pad_cell(s, eff_widths[i], align));
-                                line.push(' ');
+                                for _ in 0..CELL_PAD { line.push(' '); }
+                                line.push_str(&pad_cell(&s, eff_widths[i], align));
+                                for _ in 0..CELL_PAD { line.push(' '); }
                                 line.push('│');
                             }
                             table_lines.push((line, "body"));
-
-                            if idx + 1 < body_rows.len() {
-                                table_lines.push((row_sep.clone(), "border"));
-                            }
+                            if idx + 1 < body_rows.len() { table_lines.push((row_sep.clone(), "border")); }
                         }
 
-                        // Bottom border
                         table_lines.push((bottom_border.clone(), "border"));
 
-                        // Convert to rich spans with styling
                         let mut table_spans = Vec::new();
                         for (line, kind) in table_lines {
                             let (color, size) = match kind {
                                 "border-strong" => (Color::from_rgb(0.65, 0.70, 0.88), 14),
                                 "border" => (Color::from_rgb(0.70, 0.75, 0.90), 14),
-                                "header" => (Color::from_rgb(0.98, 0.98, 1.00), 15),
+                                // No special styling for header text; match body rows
+                                "header" => (Color::from_rgb(0.92, 0.92, 1.00), 14),
                                 _ => (Color::from_rgb(0.92, 0.92, 1.00), 14),
                             };
                             table_spans.push(
-                                span(format!("{}\n", line))
-                                    .font(Font::MONOSPACE)
-                                    .size(size)
-                                    .color(color)
+                                span(format!("{}\n", line)).font(Font::MONOSPACE).size(size).color(color)
                             );
                         }
 
-                        blocks.push(
-                            container(
-                                rich_text(table_spans)
-                            )
-                            .padding(4)
-                            .width(Length::Fill)
-                            .into()
-                        );
+                        blocks.push(container(rich_text(table_spans)).padding(4).width(Length::Fill).into());
 
                         // Reset table state
                         in_table = false;
@@ -288,6 +296,15 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                         table_alignments.clear();
                     }
                     Tag::TableHead => {
+                        // Ensure any pending header row/cell is captured
+                        if !current_cell.is_empty() {
+                            current_row.push(current_cell.clone());
+                            current_cell.clear();
+                        }
+                        if !current_row.is_empty() {
+                            header_rows.push(current_row.clone());
+                            current_row.clear();
+                        }
                         in_table_head = false; // end of header section
                     }
                     Tag::TableRow => {
@@ -535,13 +552,16 @@ enum Message {
     InputChanged(String),
     Submit,
     ResponseReceived(String),
-    StreamingUpdate(String),
     Error(String),
     Tick,
     CopyOutput,
     Exit,
     ScreenshotCaptured(Result<std::path::PathBuf, String>),
     ToggleFullscreen,
+    HistorySelect(usize),
+    HistoryDelete(usize),
+    ToggleSelectMode,
+    OutputEditorAction(text_editor::Action),
 }
 
 struct App {
@@ -556,6 +576,10 @@ struct App {
     screenshot_mode: bool,
     screenshot_path: Option<std::path::PathBuf>,
     vision_model: String,
+    history: Vec<history::HistoryEntry>,
+    selected_history: Option<usize>,
+    select_mode: bool,
+    output_editor: text_editor::Content,
 }
 
 impl App {
@@ -643,6 +667,13 @@ impl App {
             screenshot_mode: false,
             screenshot_path: None,
             vision_model,
+            history: {
+                let _ = history::init();
+                history::list_entries(100).unwrap_or_default()
+            },
+            selected_history: None,
+            select_mode: false,
+            output_editor: text_editor::Content::with_text(""),
         };
 
         let focus_task = text_input::focus(input_id);
@@ -661,18 +692,19 @@ impl App {
                     return Task::none();
                 }
 
-                let prompt = self.input_text.clone();
+                let prompt = format!("{}\n\n{}", TABLE_PLAIN_TEXT_RULES, self.input_text.clone());
                 self.is_loading = true;
                 self.response_text = String::new();
                 self.streaming_text = String::new();
 
-                // Send start notification (fire and forget)
-                std::thread::spawn(|| {
-                    let _ = Notification::new()
-                        .summary("bob-bar")
-                        .body("Processing your query...")
-                        .show();
-                });
+                if ENABLE_NOTIFICATIONS {
+                    std::thread::spawn(|| {
+                        let _ = Notification::new()
+                            .summary("bob-bar")
+                            .body("Processing your query...")
+                            .show();
+                    });
+                }
 
                 let client = self.ollama_client.clone();
 
@@ -693,36 +725,37 @@ impl App {
                     }
                 )
             }
-            Message::StreamingUpdate(text) => {
-                self.streaming_text = text;
-                Task::none()
-            }
             Message::ResponseReceived(response) => {
                 self.response_text = response;
                 self.streaming_text = String::new();
                 self.is_loading = false;
 
-                // Send completion notification (fire and forget, don't wait for action)
-                std::thread::spawn(|| {
-                    // On Linux, set urgency and timeout; other OSes may not support these
-                    #[cfg(target_os = "linux")]
-                    {
-                        let _ = Notification::new()
-                            .summary("bob-bar")
-                            .body("Query complete! Click to view results.")
-                            .urgency(notify_rust::Urgency::Normal)
-                            .timeout(notify_rust::Timeout::Milliseconds(5000))
-                            .show();
-                    }
+                if ENABLE_NOTIFICATIONS {
+                    std::thread::spawn(|| {
+                        // On Linux, set urgency and timeout; other OSes may not support these
+                        #[cfg(target_os = "linux")]
+                        {
+                            let _ = Notification::new()
+                                .summary("bob-bar")
+                                .body("Query complete! Click to view results.")
+                                .urgency(notify_rust::Urgency::Normal)
+                                .timeout(notify_rust::Timeout::Milliseconds(5000))
+                                .show();
+                        }
 
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        let _ = Notification::new()
-                            .summary("bob-bar")
-                            .body("Query complete! Click to view results.")
-                            .show();
-                    }
-                });
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            let _ = Notification::new()
+                                .summary("bob-bar")
+                                .body("Query complete! Click to view results.")
+                                .show();
+                        }
+                    });
+                }
+
+                // Save to history and refresh list
+                let _ = history::add_entry(&self.input_text, &self.response_text);
+                self.history = history::list_entries(100).unwrap_or_default();
 
                 // Also request window focus immediately
                 window::get_latest().and_then(|id| window::gain_focus(id))
@@ -736,6 +769,39 @@ impl App {
             Message::Tick => {
                 if self.is_loading {
                     self.loading_frame = (self.loading_frame + 1) % 80; // 10 frames * 8 messages
+                }
+                Task::none()
+            }
+            Message::HistorySelect(idx) => {
+                if let Some(entry) = self.history.get(idx).cloned() {
+                    self.input_text = entry.prompt;
+                    self.response_text = entry.response;
+                    self.selected_history = Some(idx);
+                    self.is_loading = false;
+                }
+                Task::none()
+            }
+            Message::OutputEditorAction(action) => {
+                // Allow selection and navigation; if the user types, it will edit the ephemeral view only
+                self.output_editor.perform(action);
+                Task::none()
+            }
+            Message::ToggleSelectMode => {
+                self.select_mode = !self.select_mode;
+                if self.select_mode {
+                    self.output_editor = text_editor::Content::with_text(&self.response_text);
+                }
+                Task::none()
+            }
+            Message::HistoryDelete(idx) => {
+                if let Some(entry) = self.history.get(idx) {
+                    let _ = history::delete_entry(entry.id);
+                }
+                self.history = history::list_entries(100).unwrap_or_default();
+                if let Some(sel) = self.selected_history {
+                    if sel == idx || sel >= self.history.len() {
+                        self.selected_history = None;
+                    }
                 }
                 Task::none()
             }
@@ -793,6 +859,10 @@ impl App {
 2. **Visible numbers** - Version numbers, error codes, line numbers, timestamps
 3. **Visible UI elements** - Application name (if shown), window titles, menu items
 4. **Visible structure** - File paths, URLs, command names (only if clearly visible)
+
+**Formatting rules:**
+- When including tables in your response, do not apply styling to table headers or table cell values. Use plain text inside tables (no bold/italic/code inside table cells).
+- Do not use Unicode symbols or emoji inside tables; use plain ASCII text only (letters, numbers, basic punctuation).
 
 **Format your response as:**
 - **Text Content:** [Quote exact text you see]
@@ -853,7 +923,7 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
         Subscription::batch([timer, events])
     }
 
-    fn view(&self) -> Element<Message> {
+    fn view(&self) -> Element<'_, Message> {
         let mut input = text_input("Type your message...", &self.input_text)
             .padding(15)
             .size(18)
@@ -872,8 +942,9 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                 scrollable(
                     container(render_markdown(self.streaming_text.clone()))
                         .padding(15)
-                        .width(Length::Fill)
+                        .width(Length::Shrink)
                 )
+                .direction(Direction::Both { vertical: Scrollbar::default(), horizontal: Scrollbar::default() })
                 .height(Length::Fill)
                 .into()
             } else {
@@ -932,34 +1003,107 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                 .into()
             }
         } else {
-            scrollable(
-                container(render_markdown(self.response_text.clone()))
-                    .padding(15)
-                    .width(Length::Fill)
-            )
-            .height(Length::Fill)
-            .into()
+            if self.select_mode {
+                scrollable(
+                    container(text_editor(&self.output_editor).on_action(Message::OutputEditorAction))
+                        .padding(15)
+                        .width(Length::Shrink)
+                )
+                .direction(Direction::Both { vertical: Scrollbar::default(), horizontal: Scrollbar::default() })
+                .height(Length::Fill)
+                .into()
+            } else {
+                scrollable(
+                    container(render_markdown(self.response_text.clone()))
+                        .padding(15)
+                        .width(Length::Shrink)
+                )
+                .direction(Direction::Both { vertical: Scrollbar::default(), horizontal: Scrollbar::default() })
+                .height(Length::Fill)
+                .into()
+            }
         };
 
         let mut content_column = column![input, output]
             .spacing(10)
-            .padding(10);
+            // Equal left/right padding (horizontal=3), vertical=10
+            .padding(Padding::from([10, 3]));
 
-        // Add copy button at bottom right if we have output
+        // Add action buttons at bottom right if we have output
         if !self.response_text.is_empty() && !self.is_loading {
-            let copy_button = container(
+            let actions = row![
+                button(text(if self.select_mode { "[Done Selecting]" } else { "[Select Text]" }).size(14))
+                    .on_press(Message::ToggleSelectMode)
+                    .padding(8),
                 button(text("[Copy]").size(14))
                     .on_press(Message::CopyOutput)
-                    .padding(10)
-            )
-            .width(Length::Fill)
-            .align_x(alignment::Horizontal::Right)
-            .padding(Padding::from([10, 10]));
+                    .padding(8)
+            ]
+            .spacing(8);
 
-            content_column = content_column.push(copy_button);
+            let actions_row = container(actions)
+                .width(Length::Fill)
+                .align_x(alignment::Horizontal::Right)
+                .padding(Padding::from([10, 10]));
+
+            content_column = content_column.push(actions_row);
         }
 
-        container(content_column)
+        // Sidebar: History list (compact)
+        let sidebar = {
+            let mut items = column![]
+                .spacing(4)
+                .padding(Padding::from([10.0, 8.0]));
+
+            // Center "History" and align its vertical center with the input height
+            items = items.push(
+                container(text("History").size(18))
+                    .width(Length::Fill)
+                    .height(Length::Fixed(INPUT_HEIGHT))
+                    .align_x(alignment::Horizontal::Center)
+                    .align_y(alignment::Vertical::Center)
+            );
+
+            // Add spacer so the list starts just below the input's bottom
+            items = items.push(Space::with_height(Length::Fixed(INPUT_HEIGHT / 2.0)));
+
+            for (i, entry) in self.history.iter().enumerate() {
+                let title = {
+                    let s = &entry.prompt;
+                    let mut it = s.chars();
+                    let taken: String = it.by_ref().take(16).collect();
+                    if it.next().is_some() { format!("{}...", taken) } else { s.clone() }
+                };
+                let select_btn = button(
+                    text(title)
+                        .size(12)
+                        .width(Length::Fill)
+                )
+                .on_press(Message::HistorySelect(i))
+                .padding(6)
+                .width(Length::Fill);
+
+                let delete_btn = button(text("×").size(12))
+                    .on_press(Message::HistoryDelete(i))
+                    .padding(6);
+
+                items = items.push(row![select_btn, delete_btn].spacing(4));
+            }
+
+            scrollable(container(items).width(Length::Fixed(180.0)))
+                .width(Length::Fixed(200.0))
+                .height(Length::Fill)
+        };
+
+        container(
+            row![
+                sidebar,
+                container(content_column)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+            ]
+            .spacing(0)
+        )
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

@@ -2,7 +2,7 @@
 set -e
 
 # bob-bar installer script
-# This script downloads and installs bob-bar from GitHub releases
+# This script builds bob-bar from source for your current machine
 
 REPO="streed/bob-bar"
 INSTALL_DIR="$HOME/.local/bin"
@@ -35,65 +35,96 @@ case "$OS_NAME" in
         ;;
 esac
 
-# Detect architecture and determine candidate asset names
 ARCH=$(uname -m)
-ASSET_CANDIDATES=()
-case "$PLATFORM" in
-    linux)
-        case "$ARCH" in
-            x86_64)
-                ASSET_CANDIDATES+=("bob-bar-linux-x86_64" "bob-bar-x86_64-unknown-linux-gnu")
-                ;;
-            aarch64|arm64)
-                # Many Linux arm64 systems report aarch64; include both
-                ASSET_CANDIDATES+=("bob-bar-linux-aarch64" "bob-bar-aarch64-unknown-linux-gnu")
-                ;;
-            *)
-                echo -e "${RED}Error: Unsupported Linux architecture: $ARCH${NC}"
-                echo "Supported architectures: x86_64, aarch64/arm64"
-                exit 1
-                ;;
-        esac
-        ;;
-    macos)
-        case "$ARCH" in
-            x86_64)
-                ASSET_CANDIDATES+=(
-                  "bob-bar-macos-x86_64"
-                  "bob-bar-darwin-x86_64"
-                  "bob-bar-x86_64-apple-darwin"
-                )
-                ;;
-            arm64)
-                ASSET_CANDIDATES+=(
-                  "bob-bar-macos-arm64"
-                  "bob-bar-darwin-arm64"
-                  "bob-bar-aarch64-apple-darwin"
-                )
-                ;;
-            *)
-                echo -e "${RED}Error: Unsupported macOS architecture: $ARCH${NC}"
-                echo "Supported architectures: x86_64, arm64"
-                exit 1
-                ;;
-        esac
-        ;;
-esac
-
 echo -e "${GREEN}✓${NC} Detected platform: $PLATFORM, architecture: $ARCH"
 
 # Check for required commands
-if ! command -v curl &> /dev/null; then
-    echo -e "${RED}Error: curl is required but not installed${NC}"
-    if [ "$PLATFORM" = "macos" ]; then
-        echo "Install it with: brew install curl (or install Xcode Command Line Tools)"
-    else
-        echo "Install it with: sudo apt install curl"
-    fi
+if ! command -v git >/dev/null 2>&1; then
+    echo -e "${RED}Error: git is required but not installed${NC}"
+    echo "Install git and re-run."
     exit 1
 fi
+echo -e "${GREEN}✓${NC} Found git"
 
-echo -e "${GREEN}✓${NC} Found curl"
+if ! command -v cargo >/dev/null 2>&1; then
+    echo -e "${RED}Error: Rust/cargo is required but not installed${NC}"
+    echo "Install Rust from https://rustup.rs and re-run."
+    exit 1
+fi
+echo -e "${GREEN}✓${NC} Found cargo"
+
+# Helper: create a simple default PNG icon if no custom icon is provided
+ensure_default_icon() {
+    DEFAULT_ICON_PATH="$CONFIG_DIR/bob-bar-default.png"
+    if [ -f "$DEFAULT_ICON_PATH" ]; then
+        echo "$DEFAULT_ICON_PATH"
+        return 0
+    fi
+    mkdir -p "$CONFIG_DIR"
+    # 1x1 transparent PNG base64 (will be resized later). Acts as a safe placeholder.
+    ICON_B64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+    if command -v base64 >/dev/null 2>&1; then
+        # Try GNU (-d), then macOS (-D)
+        (echo "$ICON_B64" | base64 -d > "$DEFAULT_ICON_PATH" 2>/dev/null) \
+          || (echo "$ICON_B64" | base64 -D > "$DEFAULT_ICON_PATH" 2>/dev/null) \
+          || true
+    fi
+    if [ -f "$DEFAULT_ICON_PATH" ]; then
+        echo "$DEFAULT_ICON_PATH"
+    else
+        echo ""  # Failed to create; caller will skip icon
+    fi
+}
+
+# Helper: convert an SVG icon to PNG (best-effort), echo resulting PNG path or empty
+convert_svg_to_png() {
+    local svg_path="$1"
+    local out_png="$2"
+    local size="512"
+    if command -v rsvg-convert >/dev/null 2>&1; then
+        rsvg-convert -w "$size" -h "$size" -o "$out_png" "$svg_path" && echo "$out_png" && return 0
+    fi
+    if command -v inkscape >/dev/null 2>&1; then
+        inkscape "$svg_path" --export-type=png --export-filename="$out_png" -w "$size" -h "$size" >/dev/null 2>&1 && echo "$out_png" && return 0
+    fi
+    if command -v convert >/dev/null 2>&1; then
+        convert -background none -density 384 "$svg_path" -resize ${size}x${size} "$out_png" >/dev/null 2>&1 && echo "$out_png" && return 0
+    fi
+    echo ""
+}
+
+# Helper: find or generate an icon PNG path to use
+resolve_icon_source() {
+    # 1) Explicit env var
+    if [ -n "${BOB_BAR_ICON:-}" ] && [ -f "$BOB_BAR_ICON" ]; then
+        echo "$BOB_BAR_ICON"; return 0
+    fi
+
+    # 2) Repo PNGs
+    for base in "${LOCAL_BUILD_DIR:-.}" .; do
+        for p in \
+            "$base/packaging/icons/bob-bar.png" \
+            "$base/assets/icon.png"; do
+            if [ -f "$p" ]; then echo "$p"; return 0; fi
+        done
+    done
+
+    # 3) Repo SVGs -> convert to PNG
+    TMP_PNG="$(mktemp).png"
+    for base in "${LOCAL_BUILD_DIR:-.}" .; do
+        for s in \
+            "$base/packaging/icons/bob-bar.svg" \
+            "$base/assets/icon.svg"; do
+            if [ -f "$s" ]; then
+                cvt="$(convert_svg_to_png "$s" "$TMP_PNG")"
+                if [ -n "$cvt" ] && [ -f "$TMP_PNG" ]; then echo "$TMP_PNG"; return 0; fi
+            fi
+        done
+    done
+
+    # 4) Fallback placeholder
+    echo "$(ensure_default_icon)"
+}
 
 # Create GUI launchers/helpers per platform
 setup_macos_app_bundle() {
@@ -117,6 +148,8 @@ setup_macos_app_bundle() {
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>bob-bar</string>
+    <key>CFBundleIconFile</key>
+    <string>app.icns</string>
     <key>CFBundleIdentifier</key>
     <string>com.mudflap.bob-bar</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -143,6 +176,31 @@ EOF
     cp "$INSTALL_DIR/bob-bar" "$MACOS_DIR/bob-bar"
     chmod +x "$MACOS_DIR/bob-bar"
 
+    # Determine icon source (custom, repo PNG/SVG, or placeholder)
+    ICON_SRC="$(resolve_icon_source)"
+
+    if [ -n "$ICON_SRC" ] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+      TMP_ICONSET="$(mktemp -d)"/AppIcon.iconset
+      mkdir -p "$TMP_ICONSET"
+      # Generate required sizes from source
+      for size in 16 32 64 128 256 512; do
+        sips -z $size $size "$ICON_SRC" --out "$TMP_ICONSET/icon_${size}x${size}.png" >/dev/null 2>&1 || true
+        dbl=$((size*2))
+        sips -z $dbl $dbl "$ICON_SRC" --out "$TMP_ICONSET/icon_${size}x${size}@2x.png" >/dev/null 2>&1 || true
+      done
+      iconutil -c icns "$TMP_ICONSET" -o "$RESOURCES_DIR/app.icns" >/dev/null 2>&1 || true
+      rm -rf "$(dirname "$TMP_ICONSET")"
+      if [ -f "$RESOURCES_DIR/app.icns" ]; then
+        echo -e "${GREEN}✓${NC} Added macOS app icon from: $ICON_SRC"
+      else
+        echo -e "${YELLOW}⚠${NC}  Could not generate .icns; continuing without custom icon"
+      fi
+    else
+      if [ -n "$ICON_SRC" ]; then
+        echo -e "${YELLOW}⚠${NC}  'sips' and/or 'iconutil' not found; skipping icon generation"
+      fi
+    fi
+
     echo -e "${GREEN}✓${NC} Created app bundle: $APP_DIR"
     echo "Open with: open \"$APP_DIR\""
 }
@@ -154,6 +212,25 @@ setup_linux_desktop_entry() {
     DESKTOP_FILE="$APPS_DIR/bob-bar.desktop"
     mkdir -p "$APPS_DIR"
 
+    # Determine icon source (custom, repo PNG/SVG, or placeholder)
+    ICON_SRC="$(resolve_icon_source)"
+
+    ICON_KEY="applications-utilities"
+    if [ -n "$ICON_SRC" ]; then
+      ICON_BASE_DIR="$HOME/.local/share/icons/hicolor"
+      mkdir -p "$ICON_BASE_DIR/256x256/apps" "$ICON_BASE_DIR/128x128/apps" "$ICON_BASE_DIR/64x64/apps"
+      # Prefer 'convert' if available, else try 'sips' via xdg-open? We'll just copy as-is and let the theme scale
+      if command -v convert >/dev/null 2>&1; then
+        convert "$ICON_SRC" -resize 256x256 "$ICON_BASE_DIR/256x256/apps/bob-bar.png" || true
+        convert "$ICON_SRC" -resize 128x128 "$ICON_BASE_DIR/128x128/apps/bob-bar.png" || true
+        convert "$ICON_SRC" -resize 64x64 "$ICON_BASE_DIR/64x64/apps/bob-bar.png" || true
+      else
+        cp "$ICON_SRC" "$ICON_BASE_DIR/256x256/apps/bob-bar.png" || true
+      fi
+      ICON_KEY="bob-bar"
+      echo -e "${GREEN}✓${NC} Installed icon under hicolor theme"
+    fi
+
     cat > "$DESKTOP_FILE" << EOF
 [Desktop Entry]
 Type=Application
@@ -161,6 +238,7 @@ Name=Bob Bar
 Comment=Fast AI launcher
 Exec=$INSTALL_DIR/bob-bar
 Terminal=false
+Icon=$ICON_KEY
 Categories=Utility;Development;
 EOF
 
@@ -178,30 +256,15 @@ build_from_source() {
         echo -e "${GREEN}✓${NC} Detected local bob-bar repository"
         LOCAL_BUILD_DIR="$(pwd)"
     else
-        echo "Local repo not detected."
-        echo "Attempting to clone repository..."
-        if command -v git >/dev/null 2>&1; then
-            git clone "https://github.com/$REPO.git" /tmp/bob-bar-build || {
-                echo -e "${YELLOW}⚠${NC}  Clone failed or network unavailable."
-                echo "To build manually, run:"
-                echo "  git clone https://github.com/$REPO.git"
-                echo "  cd bob-bar && cargo build --release"
-                exit 1
-            }
-            LOCAL_BUILD_DIR="/tmp/bob-bar-build"
-            cd "$LOCAL_BUILD_DIR"
-        else
-            echo -e "${RED}Error: git not available to clone source${NC}"
-            echo "Please clone the repo manually and re-run this installer from within it."
+        echo "Local repo not detected." 
+        echo "Cloning repository..."
+        git clone "https://github.com/$REPO.git" /tmp/bob-bar-build || {
+            echo -e "${RED}Error: Failed to clone repository${NC}"
+            echo "Please check your network and try again."
             exit 1
-        fi
-    fi
-
-    # Check for Rust toolchain
-    if ! command -v cargo &> /dev/null; then
-        echo -e "${RED}Error: Rust/cargo not found${NC}"
-        echo "Install Rust from: https://rustup.rs"
-        exit 1
+        }
+        LOCAL_BUILD_DIR="/tmp/bob-bar-build"
+        cd "$LOCAL_BUILD_DIR"
     fi
 
     echo "Building bob-bar (this may take a few minutes)..."
@@ -209,53 +272,8 @@ build_from_source() {
     BINARY_PATH="$LOCAL_BUILD_DIR/target/release/bob-bar"
 }
 
-# Get latest release info from GitHub
-echo ""
-echo "Fetching latest release..."
-RELEASE_URL="https://api.github.com/repos/$REPO/releases/latest"
-RELEASE_INFO=$(curl -s "$RELEASE_URL" || true)
-
-# Check if we got a valid response
-if [ -z "$RELEASE_INFO" ] || echo "$RELEASE_INFO" | grep -q "Not Found"; then
-    echo -e "${YELLOW}⚠${NC}  Could not fetch releases or none available"
-    build_from_source
-else
-    # Extract download URL for our platform/architecture by scanning candidates
-    DOWNLOAD_URL=""
-    for CANDIDATE in "${ASSET_CANDIDATES[@]}"; do
-        URL=$(echo "$RELEASE_INFO" | grep "browser_download_url" | grep -E "$CANDIDATE(\.|$)" | cut -d '"' -f 4 | head -n 1)
-        if [ -n "$URL" ]; then
-            DOWNLOAD_URL="$URL"
-            break
-        fi
-    done
-
-    if [ -z "$DOWNLOAD_URL" ]; then
-        echo -e "${YELLOW}⚠${NC}  No matching release asset found for $PLATFORM/$ARCH"
-        echo "Searched candidates: ${ASSET_CANDIDATES[*]}"
-        echo "Falling back to local source build if available..."
-        build_from_source
-    else
-
-        VERSION=$(echo "$RELEASE_INFO" | grep '"tag_name"' | cut -d '"' -f 4)
-        echo -e "${GREEN}✓${NC} Found version: $VERSION"
-
-        # Download binary
-        echo ""
-        echo "Downloading bob-bar..."
-        TEMP_FILE=$(mktemp)
-        curl -L -o "$TEMP_FILE" "$DOWNLOAD_URL"
-
-        if [ ! -s "$TEMP_FILE" ]; then
-            echo -e "${RED}Error: Download failed${NC}"
-            exit 1
-        fi
-
-        echo -e "${GREEN}✓${NC} Downloaded successfully"
-
-        BINARY_PATH="$TEMP_FILE"
-    fi
-fi
+# Always build from source for the current machine
+build_from_source
 
 # Create installation directory
 echo ""
@@ -359,14 +377,6 @@ if ! command -v ollama &> /dev/null; then
     echo "Install from: https://ollama.ai"
 else
     echo -e "${GREEN}✓${NC} Found Ollama"
-
-    # Check if Ollama is running
-    if curl -s http://localhost:11434/api/tags &> /dev/null; then
-        echo -e "${GREEN}✓${NC} Ollama is running"
-    else
-        echo -e "${YELLOW}⚠${NC}  Ollama is not running"
-        echo "Start it with: ollama serve"
-    fi
 fi
 
 # Check if install directory is in PATH
@@ -413,10 +423,7 @@ elif [ "$PLATFORM" = "linux" ]; then
     setup_linux_desktop_entry || echo -e "${YELLOW}⚠${NC}  Failed to create .desktop entry"
 fi
 
-# Cleanup
-if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
-    rm -f "$TEMP_FILE"
-fi
+# No temp files to clean up when building from source
 
 echo ""
 echo "╔════════════════════════════════════════╗"
