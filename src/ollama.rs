@@ -131,21 +131,19 @@ impl OllamaClient {
         let base_url = env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
         let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama2".to_string());
 
-        OllamaClient {
-            base_url,
-            model,
-            client: reqwest::Client::new(),
-            tool_executor: None,
-        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        OllamaClient { base_url, model, client, tool_executor: None }
     }
 
     pub fn with_config(base_url: String, model: String) -> Self {
-        OllamaClient {
-            base_url,
-            model,
-            client: reqwest::Client::new(),
-            tool_executor: None,
-        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        OllamaClient { base_url, model, client, tool_executor: None }
     }
 
     pub fn set_tool_executor(&mut self, executor: Arc<Mutex<ToolExecutor>>) {
@@ -232,31 +230,29 @@ Available tools:\n{}\n\n{}\n\nRemember:
 - If tools are needed, respond with ONLY the JSON (no markdown, no formatting)
 - If no tools are needed, format your response in clean markdown (use headers, lists, code blocks, etc. as appropriate)
 
-**CRITICAL: ABSOLUTELY NEVER use markdown tables (the |---|---| format). Tables will NOT display correctly.**
-Instead, present structured data using:
-- Clear section headings (## or ###)
-- Bullet points with bold labels (• **Label:** value)
-- Numbered lists for sequential information
-- Simple key-value format on separate lines", tools_json, full_context)
-            } else {
-                format!("**CRITICAL: ABSOLUTELY NEVER use markdown tables (the |---|---| format). Tables will NOT display correctly.**
-
-Instead, present structured data using:
+Present structured data using:
 - Clear section headings (## or ###)
 - Bullet points with bold labels (• **Label:** value)
 - Numbered lists for sequential information
 - Simple key-value format on separate lines
+- If you use a markdown table, include clear, specific column headers for each column (no generic names)", tools_json, full_context)
+            } else {
+                format!("Present structured data using:
+- Clear section headings (## or ###)
+- Bullet points with bold labels (• **Label:** value)
+- Numbered lists for sequential information
+- Simple key-value format on separate lines
+- If you use a markdown table, include clear, specific column headers for each column (no generic names)
 
 Format your response in clean markdown (use headers, lists, code blocks, etc. as appropriate). Be concise - keep responses to 1-3 sentences unless asked for more detail.\n\nUser: {}", prompt_for_iteration)
             }
         } else {
-            format!("**CRITICAL: ABSOLUTELY NEVER use markdown tables (the |---|---| format). Tables will NOT display correctly.**
-
-Instead, present structured data using:
+            format!("Present structured data using:
 - Clear section headings (## or ###)
 - Bullet points with bold labels (• **Label:** value)
 - Numbered lists for sequential information
 - Simple key-value format on separate lines
+- If you use a markdown table, include clear, specific column headers for each column (no generic names)
 
 Format your response in clean markdown (use headers, lists, code blocks, etc. as appropriate). Be concise - keep responses to 1-3 sentences unless asked for more detail.\n\nUser: {}", prompt_for_iteration)
         };
@@ -411,7 +407,7 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
 
                         // Set next iteration prompt
                         prompt_for_iteration = format!(
-                            "Based on the tool results above, either:\n1. Call more tools if additional information is needed to answer the original question\n2. Provide the final answer to the user in clean markdown format\n\n**CRITICAL: NEVER use markdown tables (|---|---|). Instead use bullet points with bold labels.**"
+                            "Based on the tool results above, either:\n1. Call more tools if additional information is needed to answer the original question\n2. Provide the final answer to the user in clean markdown format"
                         );
 
                         // Print the full context that will be sent to the next iteration
@@ -582,7 +578,7 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
                         let result_str = serde_json::to_string_pretty(&result)?;
                         // Send tool results back to LLM for processing
                         let process_prompt = format!(
-                            "Tool '{}' was called with:\n{}\n\nAnd returned:\n{}\n\n**CRITICAL: NEVER use markdown tables (|---|---|). Instead use bullet points with bold labels.**\n\nProvide a clear answer in markdown format with the key information the user needs.",
+                            "Tool '{}' was called with:\n{}\n\nAnd returned:\n{}\n\nProvide a clear answer in markdown format with the key information the user needs. If you present data in a table, include clear, specific column headers for each column.",
                             tool_name, params_str, result_str
                         );
 
@@ -621,7 +617,7 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
 
                         // Send tool results back to LLM for processing
                         let process_prompt = format!(
-                            "MCP tool '{}' was called with:\n{}\n\nAnd returned:\n{}\n\n**CRITICAL: NEVER use markdown tables (|---|---|). Instead use bullet points with bold labels.**\n\nProvide a clear answer in markdown format with the key information the user needs.",
+                            "MCP tool '{}' was called with:\n{}\n\nAnd returned:\n{}\n\nProvide a clear answer in markdown format with the key information the user needs. If you present data in a table, include clear, specific column headers for each column.",
                             tool_name, params_str, result_str
                         );
 

@@ -19,60 +19,111 @@ echo "║        bob-bar Installer               ║"
 echo "╚════════════════════════════════════════╝"
 echo ""
 
-# Check if running on Linux
-if [[ "$OSTYPE" != "linux-gnu"* ]]; then
-    echo -e "${RED}Error: This installer only supports Linux${NC}"
-    exit 1
-fi
-
-# Detect architecture
-ARCH=$(uname -m)
-case $ARCH in
-    x86_64)
-        ASSET_NAME="bob-bar-linux-x86_64"
+# Detect OS
+OS_NAME=$(uname -s)
+case "$OS_NAME" in
+    Linux)
+        PLATFORM="linux"
         ;;
-    aarch64)
-        ASSET_NAME="bob-bar-linux-aarch64"
+    Darwin)
+        PLATFORM="macos"
         ;;
     *)
-        echo -e "${RED}Error: Unsupported architecture: $ARCH${NC}"
-        echo "Supported architectures: x86_64, aarch64"
+        echo -e "${RED}Error: Unsupported OS: $OS_NAME${NC}"
+        echo "Supported OS: Linux, macOS"
         exit 1
         ;;
 esac
 
-echo -e "${GREEN}✓${NC} Detected architecture: $ARCH"
+# Detect architecture and determine candidate asset names
+ARCH=$(uname -m)
+ASSET_CANDIDATES=()
+case "$PLATFORM" in
+    linux)
+        case "$ARCH" in
+            x86_64)
+                ASSET_CANDIDATES+=("bob-bar-linux-x86_64" "bob-bar-x86_64-unknown-linux-gnu")
+                ;;
+            aarch64|arm64)
+                # Many Linux arm64 systems report aarch64; include both
+                ASSET_CANDIDATES+=("bob-bar-linux-aarch64" "bob-bar-aarch64-unknown-linux-gnu")
+                ;;
+            *)
+                echo -e "${RED}Error: Unsupported Linux architecture: $ARCH${NC}"
+                echo "Supported architectures: x86_64, aarch64/arm64"
+                exit 1
+                ;;
+        esac
+        ;;
+    macos)
+        case "$ARCH" in
+            x86_64)
+                ASSET_CANDIDATES+=(
+                  "bob-bar-macos-x86_64"
+                  "bob-bar-darwin-x86_64"
+                  "bob-bar-x86_64-apple-darwin"
+                )
+                ;;
+            arm64)
+                ASSET_CANDIDATES+=(
+                  "bob-bar-macos-arm64"
+                  "bob-bar-darwin-arm64"
+                  "bob-bar-aarch64-apple-darwin"
+                )
+                ;;
+            *)
+                echo -e "${RED}Error: Unsupported macOS architecture: $ARCH${NC}"
+                echo "Supported architectures: x86_64, arm64"
+                exit 1
+                ;;
+        esac
+        ;;
+esac
+
+echo -e "${GREEN}✓${NC} Detected platform: $PLATFORM, architecture: $ARCH"
 
 # Check for required commands
 if ! command -v curl &> /dev/null; then
     echo -e "${RED}Error: curl is required but not installed${NC}"
-    echo "Install it with: sudo apt install curl"
+    if [ "$PLATFORM" = "macos" ]; then
+        echo "Install it with: brew install curl (or install Xcode Command Line Tools)"
+    else
+        echo "Install it with: sudo apt install curl"
+    fi
     exit 1
 fi
 
 echo -e "${GREEN}✓${NC} Found curl"
 
-# Get latest release info from GitHub
-echo ""
-echo "Fetching latest release..."
-RELEASE_URL="https://api.github.com/repos/$REPO/releases/latest"
-RELEASE_INFO=$(curl -s "$RELEASE_URL")
+# Helper: build bob-bar from source (preferring current repo)
+build_from_source() {
+    echo "Building from source..."
 
-# Check if we got a valid response
-if echo "$RELEASE_INFO" | grep -q "Not Found"; then
-    echo -e "${RED}Error: Repository not found or no releases available${NC}"
-    echo "Building from source instead..."
-
-    # Check if we're already in the repo
-    if [ -f "Cargo.toml" ] && grep -q "bob-bar" Cargo.toml; then
-        echo -e "${GREEN}✓${NC} Already in bob-bar directory, building..."
+    # If we're already in the bob-bar repo, use it; otherwise try to clone
+    if [ -f "Cargo.toml" ] && grep -q 'name *= *"bob-bar"' Cargo.toml; then
+        echo -e "${GREEN}✓${NC} Detected local bob-bar repository"
+        LOCAL_BUILD_DIR="$(pwd)"
     else
-        echo "Cloning repository..."
-        git clone "https://github.com/$REPO.git" /tmp/bob-bar-build
-        cd /tmp/bob-bar-build
+        echo "Local repo not detected."
+        echo "Attempting to clone repository..."
+        if command -v git >/dev/null 2>&1; then
+            git clone "https://github.com/$REPO.git" /tmp/bob-bar-build || {
+                echo -e "${YELLOW}⚠${NC}  Clone failed or network unavailable."
+                echo "To build manually, run:"
+                echo "  git clone https://github.com/$REPO.git"
+                echo "  cd bob-bar && cargo build --release"
+                exit 1
+            }
+            LOCAL_BUILD_DIR="/tmp/bob-bar-build"
+            cd "$LOCAL_BUILD_DIR"
+        else
+            echo -e "${RED}Error: git not available to clone source${NC}"
+            echo "Please clone the repo manually and re-run this installer from within it."
+            exit 1
+        fi
     fi
 
-    # Check for Rust
+    # Check for Rust toolchain
     if ! command -v cargo &> /dev/null; then
         echo -e "${RED}Error: Rust/cargo not found${NC}"
         echo "Install Rust from: https://rustup.rs"
@@ -81,36 +132,55 @@ if echo "$RELEASE_INFO" | grep -q "Not Found"; then
 
     echo "Building bob-bar (this may take a few minutes)..."
     cargo build --release
+    BINARY_PATH="$LOCAL_BUILD_DIR/target/release/bob-bar"
+}
 
-    BINARY_PATH="target/release/bob-bar"
+# Get latest release info from GitHub
+echo ""
+echo "Fetching latest release..."
+RELEASE_URL="https://api.github.com/repos/$REPO/releases/latest"
+RELEASE_INFO=$(curl -s "$RELEASE_URL" || true)
+
+# Check if we got a valid response
+if [ -z "$RELEASE_INFO" ] || echo "$RELEASE_INFO" | grep -q "Not Found"; then
+    echo -e "${YELLOW}⚠${NC}  Could not fetch releases or none available"
+    build_from_source
 else
-    # Extract download URL for our architecture
-    DOWNLOAD_URL=$(echo "$RELEASE_INFO" | grep "browser_download_url.*$ASSET_NAME" | cut -d '"' -f 4)
+    # Extract download URL for our platform/architecture by scanning candidates
+    DOWNLOAD_URL=""
+    for CANDIDATE in "${ASSET_CANDIDATES[@]}"; do
+        URL=$(echo "$RELEASE_INFO" | grep "browser_download_url" | grep -E "$CANDIDATE(\.|$)" | cut -d '"' -f 4 | head -n 1)
+        if [ -n "$URL" ]; then
+            DOWNLOAD_URL="$URL"
+            break
+        fi
+    done
 
     if [ -z "$DOWNLOAD_URL" ]; then
-        echo -e "${RED}Error: Could not find release asset for $ARCH${NC}"
-        echo "Available assets:"
-        echo "$RELEASE_INFO" | grep "browser_download_url" | cut -d '"' -f 4
-        exit 1
+        echo -e "${YELLOW}⚠${NC}  No matching release asset found for $PLATFORM/$ARCH"
+        echo "Searched candidates: ${ASSET_CANDIDATES[*]}"
+        echo "Falling back to local source build if available..."
+        build_from_source
+    else
+
+        VERSION=$(echo "$RELEASE_INFO" | grep '"tag_name"' | cut -d '"' -f 4)
+        echo -e "${GREEN}✓${NC} Found version: $VERSION"
+
+        # Download binary
+        echo ""
+        echo "Downloading bob-bar..."
+        TEMP_FILE=$(mktemp)
+        curl -L -o "$TEMP_FILE" "$DOWNLOAD_URL"
+
+        if [ ! -s "$TEMP_FILE" ]; then
+            echo -e "${RED}Error: Download failed${NC}"
+            exit 1
+        fi
+
+        echo -e "${GREEN}✓${NC} Downloaded successfully"
+
+        BINARY_PATH="$TEMP_FILE"
     fi
-
-    VERSION=$(echo "$RELEASE_INFO" | grep '"tag_name"' | cut -d '"' -f 4)
-    echo -e "${GREEN}✓${NC} Found version: $VERSION"
-
-    # Download binary
-    echo ""
-    echo "Downloading bob-bar..."
-    TEMP_FILE=$(mktemp)
-    curl -L -o "$TEMP_FILE" "$DOWNLOAD_URL"
-
-    if [ ! -s "$TEMP_FILE" ]; then
-        echo -e "${RED}Error: Download failed${NC}"
-        exit 1
-    fi
-
-    echo -e "${GREEN}✓${NC} Downloaded successfully"
-
-    BINARY_PATH="$TEMP_FILE"
 fi
 
 # Create installation directory
@@ -229,15 +299,24 @@ fi
 # Check for screenshot tool
 echo ""
 echo "Checking for screenshot tool..."
-if command -v grim &> /dev/null; then
-    echo -e "${GREEN}✓${NC} Found grim (Wayland screenshot tool)"
-elif command -v scrot &> /dev/null; then
-    echo -e "${GREEN}✓${NC} Found scrot (X11 screenshot tool)"
+if [ "$PLATFORM" = "macos" ]; then
+    if command -v screencapture &> /dev/null; then
+        echo -e "${GREEN}✓${NC} Found screencapture (macOS built-in)"
+    else
+        echo -e "${YELLOW}⚠${NC}  Could not find macOS 'screencapture' tool"
+        echo "It should be built-in; ensure Xcode Command Line Tools are installed."
+    fi
 else
-    echo -e "${YELLOW}⚠${NC}  No screenshot tool found"
-    echo "For screenshot analysis, install one of:"
-    echo "  - Wayland: sudo apt install grim"
-    echo "  - X11: sudo apt install scrot"
+    if command -v grim &> /dev/null; then
+        echo -e "${GREEN}✓${NC} Found grim (Wayland screenshot tool)"
+    elif command -v scrot &> /dev/null; then
+        echo -e "${GREEN}✓${NC} Found scrot (X11 screenshot tool)"
+    else
+        echo -e "${YELLOW}⚠${NC}  No screenshot tool found"
+        echo "For screenshot analysis, install one of:"
+        echo "  - Wayland: sudo apt install grim"
+        echo "  - X11: sudo apt install scrot"
+    fi
 fi
 
 echo ""

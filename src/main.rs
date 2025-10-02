@@ -16,15 +16,24 @@ use iced::{
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use pulldown_cmark::{Parser, Event as MarkdownEvent, Tag, HeadingLevel};
+use pulldown_cmark::{Parser, Event as MarkdownEvent, Tag, HeadingLevel, Options, Alignment};
 use notify_rust::Notification;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
 
 fn render_markdown(markdown: String) -> Element<'static, Message> {
-    let parser = Parser::new(&markdown);
+    let mut md_options = Options::empty();
+    md_options.insert(Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(&markdown, md_options);
     let mut spans = Vec::new();
+    let mut blocks: Vec<Element<'static, Message>> = Vec::new();
+    let mut flush_spans = |spans: &mut Vec<_>, blocks: &mut Vec<Element<'static, Message>>| {
+        if !spans.is_empty() {
+            blocks.push(rich_text(spans.clone()).into());
+            spans.clear();
+        }
+    };
     let mut current_text = String::new();
     let mut in_code_block = false;
     let mut code_block_content = String::new();
@@ -32,11 +41,37 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
     let mut _in_italic = false;
     let mut heading_level: Option<HeadingLevel> = None;
     let mut in_list = false;
+    // Table state
+    let mut in_table = false;
+    let mut in_table_head = false;
+    let mut current_row: Vec<String> = Vec::new();
+    let mut current_cell = String::new();
+    let mut header_rows: Vec<Vec<String>> = Vec::new();
+    let mut body_rows: Vec<Vec<String>> = Vec::new();
+    let mut table_alignments: Vec<Alignment> = Vec::new();
 
     for event in parser {
         match event {
             MarkdownEvent::Start(tag) => {
                 match tag {
+                    Tag::Table(aligns) => {
+                        // Flush any pending inline content before starting a table
+                        flush_spans(&mut spans, &mut blocks);
+                        in_table = true;
+                        in_table_head = false;
+                        header_rows.clear();
+                        body_rows.clear();
+                        table_alignments = aligns;
+                    }
+                    Tag::TableHead => {
+                        in_table_head = true;
+                    }
+                    Tag::TableRow => {
+                        current_row.clear();
+                    }
+                    Tag::TableCell => {
+                        current_cell.clear();
+                    }
                     Tag::Heading(level, _, _) => {
                         // Flush current text before heading
                         if !current_text.is_empty() {
@@ -108,6 +143,171 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
             }
             MarkdownEvent::End(tag) => {
                 match tag {
+                    Tag::Table(_) => {
+                        // Close any in-progress cell/row
+                        if !current_cell.is_empty() {
+                            current_row.push(current_cell.clone());
+                            current_cell.clear();
+                        }
+                        if !current_row.is_empty() {
+                            if in_table_head {
+                                header_rows.push(current_row.clone());
+                            } else {
+                                body_rows.push(current_row.clone());
+                            }
+                            current_row.clear();
+                        }
+
+                        // Build a monospaced table rendering
+                        let mut rows = Vec::new();
+                        rows.extend(header_rows.iter().cloned());
+                        rows.extend(body_rows.iter().cloned());
+
+                        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                        let mut col_widths = vec![0usize; cols];
+                        for r in &rows {
+                            for (i, cell) in r.iter().enumerate() {
+                                col_widths[i] = col_widths[i].max(cell.chars().count());
+                            }
+                        }
+                        // Use uniform column width so all columns align evenly.
+                        // Each column will be as wide as the longest column.
+                        let uniform_width = col_widths.iter().copied().max().unwrap_or(0);
+                        let eff_widths = if cols > 0 { vec![uniform_width; cols] } else { Vec::new() };
+
+                        let pad_cell = |s: &str, width: usize, align: Alignment| -> String {
+                            let len = s.chars().count();
+                            if len >= width { return s.to_string(); }
+                            let pad = width - len;
+                            match align {
+                                Alignment::Left | Alignment::None => format!("{}{}", s, " ".repeat(pad)),
+                                Alignment::Right => format!("{}{}", " ".repeat(pad), s),
+                                Alignment::Center => {
+                                    let left = pad / 2;
+                                    let right = pad - left;
+                                    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+                                }
+                            }
+                        };
+
+                        // Build Unicode box-drawn borders
+                        let make_border = |left: char, mid: char, right: char, horiz: char| {
+                            let mut s = String::new();
+                            s.push(left);
+                            for i in 0..cols {
+                                let seg = eff_widths[i] + 2; // account for padding spaces
+                                for _ in 0..seg.max(3) { s.push(horiz); }
+                                if i + 1 < cols { s.push(mid); } else { s.push(right); }
+                            }
+                            s
+                        };
+
+                        let top_border = make_border('┌', '┬', '┐', '─');
+                        let header_sep = make_border('╞', '╪', '╡', '═');
+                        let row_sep = make_border('├', '┼', '┤', '─');
+                        let bottom_border = make_border('└', '┴', '┘', '─');
+
+                        // Build table as styled lines
+                        let mut table_lines: Vec<(String, &'static str)> = Vec::new();
+
+                        // Header section
+                        table_lines.push((top_border.clone(), "border"));
+                        for r in &header_rows {
+                            let mut line = String::new();
+                            line.push('│');
+                            for i in 0..cols {
+                                let s = r.get(i).map(|s| s.as_str()).unwrap_or("");
+                                let align = table_alignments.get(i).cloned().unwrap_or(Alignment::Left);
+                                line.push(' ');
+                                line.push_str(&pad_cell(s, eff_widths[i], align));
+                                line.push(' ');
+                                line.push('│');
+                            }
+                            table_lines.push((line, "header"));
+                        }
+
+                        if !header_rows.is_empty() {
+                            table_lines.push((header_sep.clone(), "border-strong"));
+                        }
+
+                        // Body rows (with separators between rows)
+                        for (idx, r) in body_rows.iter().enumerate() {
+                            let mut line = String::new();
+                            line.push('│');
+                            for i in 0..cols {
+                                let s = r.get(i).map(|s| s.as_str()).unwrap_or("");
+                                let align = table_alignments.get(i).cloned().unwrap_or(Alignment::Left);
+                                line.push(' ');
+                                line.push_str(&pad_cell(s, eff_widths[i], align));
+                                line.push(' ');
+                                line.push('│');
+                            }
+                            table_lines.push((line, "body"));
+
+                            if idx + 1 < body_rows.len() {
+                                table_lines.push((row_sep.clone(), "border"));
+                            }
+                        }
+
+                        // Bottom border
+                        table_lines.push((bottom_border.clone(), "border"));
+
+                        // Convert to rich spans with styling
+                        let mut table_spans = Vec::new();
+                        for (line, kind) in table_lines {
+                            let (color, size) = match kind {
+                                "border-strong" => (Color::from_rgb(0.65, 0.70, 0.88), 14),
+                                "border" => (Color::from_rgb(0.70, 0.75, 0.90), 14),
+                                "header" => (Color::from_rgb(0.98, 0.98, 1.00), 15),
+                                _ => (Color::from_rgb(0.92, 0.92, 1.00), 14),
+                            };
+                            table_spans.push(
+                                span(format!("{}\n", line))
+                                    .font(Font::MONOSPACE)
+                                    .size(size)
+                                    .color(color)
+                            );
+                        }
+
+                        blocks.push(
+                            container(
+                                rich_text(table_spans)
+                            )
+                            .padding(4)
+                            .width(Length::Fill)
+                            .into()
+                        );
+
+                        // Reset table state
+                        in_table = false;
+                        in_table_head = false;
+                        header_rows.clear();
+                        body_rows.clear();
+                        table_alignments.clear();
+                    }
+                    Tag::TableHead => {
+                        in_table_head = false; // end of header section
+                    }
+                    Tag::TableRow => {
+                        if !current_cell.is_empty() {
+                            current_row.push(current_cell.clone());
+                            current_cell.clear();
+                        }
+                        if !current_row.is_empty() {
+                            if in_table_head {
+                                header_rows.push(current_row.clone());
+                            } else {
+                                body_rows.push(current_row.clone());
+                            }
+                            current_row.clear();
+                        }
+                    }
+                    Tag::TableCell => {
+                        if !current_cell.is_empty() {
+                            current_row.push(current_cell.clone());
+                            current_cell.clear();
+                        }
+                    }
                     Tag::Heading(_, _, _) => {
                         if !current_text.is_empty() {
                             let size = match heading_level {
@@ -191,7 +391,9 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                 }
             }
             MarkdownEvent::Text(t) => {
-                if in_code_block {
+                if in_table {
+                    current_cell.push_str(&t);
+                } else if in_code_block {
                     code_block_content.push_str(&t);
                 } else {
                     current_text.push_str(&t);
@@ -199,23 +401,27 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
             }
             MarkdownEvent::Code(code) => {
                 // Flush current text
-                if !current_text.is_empty() {
-                    spans.push(span(current_text.clone()));
-                    current_text.clear();
+                if in_table {
+                    current_cell.push_str(&format!("`{}`", code));
+                } else {
+                    if !current_text.is_empty() {
+                        spans.push(span(current_text.clone()));
+                        current_text.clear();
+                    }
+                    // Add inline code
+                    spans.push(
+                        span(format!("`{}`", code))
+                            .font(Font::MONOSPACE)
+                            .size(14)
+                            .color(Color::from_rgb(0.9, 0.6, 0.6))
+                    );
                 }
-                // Add inline code
-                spans.push(
-                    span(format!("`{}`", code))
-                        .font(Font::MONOSPACE)
-                        .size(14)
-                        .color(Color::from_rgb(0.9, 0.6, 0.6))
-                );
             }
             MarkdownEvent::SoftBreak => {
-                current_text.push(' ');
+                if in_table { current_cell.push(' '); } else { current_text.push(' '); }
             }
             MarkdownEvent::HardBreak => {
-                current_text.push('\n');
+                if in_table { current_cell.push('\n'); } else { current_text.push('\n'); }
             }
             _ => {}
         }
@@ -232,6 +438,11 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
                 .size(14)
                 .color(Color::from_rgb(0.8, 0.9, 0.8))
         );
+    }
+
+    if !blocks.is_empty() {
+        flush_spans(&mut spans, &mut blocks);
+        return column(blocks).spacing(6).into();
     }
 
     if spans.is_empty() {
@@ -267,11 +478,11 @@ fn main() -> iced::Result {
             .window(window::Settings {
                 size: iced::Size::new(config.window.width as f32, config.window.height as f32),
                 position: window::Position::Centered,
-                level: Level::AlwaysOnTop,
+                // Use a normal window level so it does not stay above others
+                level: Level::Normal,
                 decorations: true,
                 resizable: true,
                 platform_specific: PlatformSpecific {
-                    application_id: "bob-bar".to_string(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -288,11 +499,11 @@ fn run_screenshot_mode(config: config::Config) -> iced::Result {
         .window(window::Settings {
             size: iced::Size::new(config.window.width as f32, config.window.height as f32),
             position: window::Position::Centered,
-            level: Level::AlwaysOnTop,
+            // Screenshot mode should also not force always-on-top
+            level: Level::Normal,
             decorations: true,
             resizable: true,
             platform_specific: PlatformSpecific {
-                application_id: "bob-bar".to_string(),
                 ..Default::default()
             },
             ..Default::default()
@@ -328,6 +539,7 @@ enum Message {
     CopyOutput,
     Exit,
     ScreenshotCaptured(Result<std::path::PathBuf, String>),
+    ToggleFullscreen,
 }
 
 struct App {
@@ -335,6 +547,7 @@ struct App {
     response_text: String,
     streaming_text: String,
     is_loading: bool,
+    is_fullscreen: bool,
     loading_frame: usize,
     ollama_client: Arc<Mutex<ollama::OllamaClient>>,
     input_id: Id,
@@ -421,6 +634,7 @@ impl App {
             response_text: String::new(),
             streaming_text: String::new(),
             is_loading: false,
+            is_fullscreen: false,
             loading_frame: 0,
             ollama_client: Arc::new(Mutex::new(ollama_client)),
             input_id: input_id.clone(),
@@ -430,10 +644,8 @@ impl App {
         };
 
         let focus_task = text_input::focus(input_id);
-        let window_task = window::get_latest()
-            .and_then(|id| window::change_level(id, Level::AlwaysOnTop));
-
-        (app, Task::batch([focus_task, window_task]))
+        // Do not force always-on-top; keep normal stacking behavior
+        (app, Task::batch([focus_task]))
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -490,12 +702,24 @@ impl App {
 
                 // Send completion notification (fire and forget, don't wait for action)
                 std::thread::spawn(|| {
-                    let _ = Notification::new()
-                        .summary("bob-bar")
-                        .body("Query complete! Click to view results.")
-                        .urgency(notify_rust::Urgency::Normal)
-                        .timeout(notify_rust::Timeout::Milliseconds(5000))
-                        .show();
+                    // On Linux, set urgency and timeout; other OSes may not support these
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = Notification::new()
+                            .summary("bob-bar")
+                            .body("Query complete! Click to view results.")
+                            .urgency(notify_rust::Urgency::Normal)
+                            .timeout(notify_rust::Timeout::Milliseconds(5000))
+                            .show();
+                    }
+
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = Notification::new()
+                            .summary("bob-bar")
+                            .body("Query complete! Click to view results.")
+                            .show();
+                    }
                 });
 
                 // Also request window focus immediately
@@ -518,6 +742,16 @@ impl App {
             }
             Message::Exit => {
                 iced::exit()
+            }
+            Message::ToggleFullscreen => {
+                // Toggle true fullscreen mode using iced window API
+                let new_mode = if self.is_fullscreen {
+                    window::Mode::Windowed
+                } else {
+                    window::Mode::Fullscreen
+                };
+                self.is_fullscreen = !self.is_fullscreen;
+                window::get_latest().and_then(move |id| window::change_mode(id, new_mode))
             }
             Message::ScreenshotCaptured(result) => {
                 match result {
@@ -597,14 +831,20 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
         };
 
         let events = event::listen_with(|event, _status, _id| {
-            if let IcedEvent::Keyboard(keyboard::Event::KeyPressed {
-                key: Key::Named(keyboard::key::Named::Escape),
-                ..
-            }) = event
-            {
-                Some(Message::Exit)
-            } else {
-                None
+            match event {
+                IcedEvent::Keyboard(keyboard::Event::KeyPressed { key: Key::Named(keyboard::key::Named::Escape), .. }) => {
+                    Some(Message::Exit)
+                }
+                IcedEvent::Keyboard(keyboard::Event::KeyPressed { key: Key::Character(c), modifiers, .. }) => {
+                    // macOS-style fullscreen shortcut: Cmd + Ctrl + F
+                    // Use `logo()` to represent Command on macOS
+                    if (c == "f" || c == "F") && modifiers.control() && modifiers.logo() {
+                        Some(Message::ToggleFullscreen)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             }
         });
 
