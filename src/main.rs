@@ -39,7 +39,7 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
     let mut blocks: Vec<Element<'static, Message>> = Vec::new();
     let flush_spans = |spans: &mut Vec<_>, blocks: &mut Vec<Element<'static, Message>>| {
         if !spans.is_empty() {
-            blocks.push(rich_text(spans.clone()).into());
+            blocks.push(rich_text(spans.clone()).width(Length::Fill).into());
             spans.clear();
         }
     };
@@ -467,7 +467,7 @@ fn render_markdown(markdown: String) -> Element<'static, Message> {
     if spans.is_empty() {
         text("").into()
     } else {
-        rich_text(spans).into()
+        rich_text(spans).width(Length::Fill).into()
     }
 }
 
@@ -942,9 +942,9 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                 scrollable(
                     container(render_markdown(self.streaming_text.clone()))
                         .padding(15)
-                        .width(Length::Shrink)
+                        .width(Length::Fill)
                 )
-                .direction(Direction::Both { vertical: Scrollbar::default(), horizontal: Scrollbar::default() })
+                .direction(Direction::Vertical(Scrollbar::default()))
                 .height(Length::Fill)
                 .into()
             } else {
@@ -1005,20 +1005,22 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
         } else {
             if self.select_mode {
                 scrollable(
-                    container(text_editor(&self.output_editor).on_action(Message::OutputEditorAction))
+                    container(text_editor(&self.output_editor)
+                            .on_action(Message::OutputEditorAction)
+                    )
                         .padding(15)
-                        .width(Length::Shrink)
+                        .width(Length::Fill)
                 )
-                .direction(Direction::Both { vertical: Scrollbar::default(), horizontal: Scrollbar::default() })
+                .direction(Direction::Vertical(Scrollbar::default()))
                 .height(Length::Fill)
                 .into()
             } else {
                 scrollable(
                     container(render_markdown(self.response_text.clone()))
                         .padding(15)
-                        .width(Length::Shrink)
+                        .width(Length::Fill)
                 )
-                .direction(Direction::Both { vertical: Scrollbar::default(), horizontal: Scrollbar::default() })
+                .direction(Direction::Vertical(Scrollbar::default()))
                 .height(Length::Fill)
                 .into()
             }
@@ -1074,18 +1076,33 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                     let taken: String = it.by_ref().take(16).collect();
                     if it.next().is_some() { format!("{}...", taken) } else { s.clone() }
                 };
-                let select_btn = button(
-                    text(title)
-                        .size(12)
-                        .width(Length::Fill)
-                )
-                .on_press(Message::HistorySelect(i))
-                .padding(6)
-                .width(Length::Fill);
+                let select_btn = if self.is_loading {
+                    button(
+                        text(title)
+                            .size(12)
+                            .width(Length::Fill)
+                    )
+                    .padding(6)
+                    .width(Length::Fill)
+                } else {
+                    button(
+                        text(title)
+                            .size(12)
+                            .width(Length::Fill)
+                    )
+                    .on_press(Message::HistorySelect(i))
+                    .padding(6)
+                    .width(Length::Fill)
+                };
 
-                let delete_btn = button(text("×").size(12))
-                    .on_press(Message::HistoryDelete(i))
-                    .padding(6);
+                let delete_btn = if self.is_loading {
+                    button(text("×").size(12))
+                        .padding(6)
+                } else {
+                    button(text("×").size(12))
+                        .on_press(Message::HistoryDelete(i))
+                        .padding(6)
+                };
 
                 items = items.push(row![select_btn, delete_btn].spacing(4));
             }
