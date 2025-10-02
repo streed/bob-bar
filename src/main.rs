@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod config;
 mod ollama;
 mod tools;
@@ -875,8 +877,17 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                 .height(Length::Fill)
                 .into()
             } else {
-                // Show animated loading text with fun messages using unicode spinner
-                let loading_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                // Show animated loading text with a more elegant ASCII spinner (bouncing star)
+                let loading_frames = [
+                    "[*    ]",
+                    "[ *   ]",
+                    "[  *  ]",
+                    "[   * ]",
+                    "[    *]",
+                    "[   * ]",
+                    "[  *  ]",
+                    "[ *   ]",
+                ];
                 let loading_messages = if self.screenshot_mode {
                     [
                         "Reading visible text...",

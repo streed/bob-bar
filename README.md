@@ -135,6 +135,27 @@ Debug mode (shows detailed logging):
 bob-bar --debug
 ```
 
+### Run Without Opening a Terminal
+
+macOS (double-clickable app):
+
+1) Build the binary
+```bash
+cargo build --release
+```
+2) Create the app bundle
+```bash
+./packaging/macos/make_app_bundle.sh
+```
+3) Open in Finder
+```bash
+open "dist/macos/Bob Bar.app"
+```
+
+Notes:
+- The bundle includes a minimal `Info.plist` and runs without launching Terminal.
+- To hide the Dock icon and menu bar, set `LSUIElement` to `true` in `packaging/macos/Info.plist`.
+
 Make sure Ollama is running first:
 ```bash
 ollama serve
@@ -327,4 +348,3 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 ---
 
 Made with ❤️ and Rust
-

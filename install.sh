@@ -95,6 +95,80 @@ fi
 
 echo -e "${GREEN}✓${NC} Found curl"
 
+# Create GUI launchers/helpers per platform
+setup_macos_app_bundle() {
+    echo ""
+    echo "Setting up macOS app bundle..."
+    APP_NAME="Bob Bar"
+    APP_DIR="$HOME/Applications/$APP_NAME.app"
+    CONTENTS_DIR="$APP_DIR/Contents"
+    MACOS_DIR="$CONTENTS_DIR/MacOS"
+    RESOURCES_DIR="$CONTENTS_DIR/Resources"
+
+    mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+
+    # Write Info.plist
+    cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>bob-bar</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.mudflap.bob-bar</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Bob Bar</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.13</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+    # Copy executable into bundle
+    cp "$INSTALL_DIR/bob-bar" "$MACOS_DIR/bob-bar"
+    chmod +x "$MACOS_DIR/bob-bar"
+
+    echo -e "${GREEN}✓${NC} Created app bundle: $APP_DIR"
+    echo "Open with: open \"$APP_DIR\""
+}
+
+setup_linux_desktop_entry() {
+    echo ""
+    echo "Setting up Linux desktop entry..."
+    APPS_DIR="$HOME/.local/share/applications"
+    DESKTOP_FILE="$APPS_DIR/bob-bar.desktop"
+    mkdir -p "$APPS_DIR"
+
+    cat > "$DESKTOP_FILE" << EOF
+[Desktop Entry]
+Type=Application
+Name=Bob Bar
+Comment=Fast AI launcher
+Exec=$INSTALL_DIR/bob-bar
+Terminal=false
+Categories=Utility;Development;
+EOF
+
+    chmod 644 "$DESKTOP_FILE"
+    echo -e "${GREEN}✓${NC} Installed desktop launcher: $DESKTOP_FILE"
+    echo "You may need to run 'update-desktop-database' or re-log for menus to refresh."
+}
+
 # Helper: build bob-bar from source (preferring current repo)
 build_from_source() {
     echo "Building from source..."
@@ -332,6 +406,13 @@ else
     echo -e "${GREEN}✓${NC} $INSTALL_DIR is in PATH"
 fi
 
+# Platform-specific GUI integration
+if [ "$PLATFORM" = "macos" ]; then
+    setup_macos_app_bundle || echo -e "${YELLOW}⚠${NC}  Failed to create macOS app bundle"
+elif [ "$PLATFORM" = "linux" ]; then
+    setup_linux_desktop_entry || echo -e "${YELLOW}⚠${NC}  Failed to create .desktop entry"
+fi
+
 # Cleanup
 if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
     rm -f "$TEMP_FILE"
@@ -345,6 +426,14 @@ echo ""
 echo "Run bob-bar with:"
 echo "    bob-bar"
 echo ""
+if [ "$PLATFORM" = "macos" ]; then
+    echo "Or double-click:"
+    echo "    ~/Applications/Bob Bar.app"
+    echo ""
+elif [ "$PLATFORM" = "linux" ]; then
+    echo "It should now appear in your app launcher menu as 'Bob Bar'."
+    echo ""
+fi
 if [ "$CONFIG_EXISTS" = false ]; then
     echo "Configuration files created at:"
     echo "    $CONFIG_DIR"
