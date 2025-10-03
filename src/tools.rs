@@ -5,6 +5,9 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use toml;
+use std::time::{Instant, Duration};
+use std::sync::Mutex as StdMutex;
+use tokio::sync::Mutex as TokioMutex;
 
 macro_rules! debug_println {
     ($($arg:tt)*) => {
@@ -48,6 +51,41 @@ pub struct HttpTool {
     pub response_format: String,
     #[serde(default)]
     pub response_path: Option<String>,  // Optional JSON path to extract from response (e.g., "data.results[0].value")
+    #[serde(default = "default_expected_status")]
+    pub expected_status: Vec<String>,  // Expected successful status codes (default: ["2xx"]) - supports wildcards like "2xx", "3xx" or specific codes like "200"
+    #[serde(default)]
+    pub acceptable_status: Vec<String>,  // Acceptable status codes to ignore result (empty response) - supports wildcards
+    #[serde(default)]
+    pub error_status: Vec<String>,  // Status codes that should throw detailed errors (if empty, all non-expected are errors) - supports wildcards
+}
+
+fn default_expected_status() -> Vec<String> {
+    vec!["2xx".to_string(), "3xx".to_string()]
+}
+
+/// Check if a status code matches a pattern (supports wildcards like "2xx" or specific codes like "200")
+fn status_matches(status_code: u16, pattern: &str) -> bool {
+    // Check for exact match first
+    if let Ok(exact) = pattern.parse::<u16>() {
+        return status_code == exact;
+    }
+
+    // Check for wildcard patterns like "2xx", "3xx", etc.
+    if pattern.ends_with("xx") && pattern.len() == 3 {
+        if let Some(prefix) = pattern.chars().next() {
+            if let Some(digit) = prefix.to_digit(10) {
+                let status_hundreds = status_code / 100;
+                return status_hundreds == digit as u16;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if status code matches any pattern in the list
+fn status_in_list(status_code: u16, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| status_matches(status_code, pattern))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -78,12 +116,20 @@ pub struct McpConnection {
     stdout: BufReader<tokio::process::ChildStdout>,
 }
 
+// Track tool usage for rate limiting
+#[derive(Debug, Clone)]
+struct ToolUsage {
+    last_call: Instant,
+    call_count: usize,
+}
+
 pub struct ToolExecutor {
     pub config: ToolsConfig,
     http_client: reqwest::Client,
-    mcp_connections: HashMap<String, McpConnection>,
-    mcp_tools: HashMap<String, Vec<McpTool>>,  // Store discovered MCP tools per server
+    mcp_connections: TokioMutex<HashMap<String, McpConnection>>,  // Tokio mutex for async-safe access
+    mcp_tools: StdMutex<HashMap<String, Vec<McpTool>>>,  // Store discovered MCP tools per server
     api_keys: HashMap<String, String>,
+    tool_usage: StdMutex<HashMap<String, ToolUsage>>,  // Track usage per tool (with interior mutability)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -98,9 +144,10 @@ impl ToolExecutor {
         ToolExecutor {
             config,
             http_client: reqwest::Client::new(),
-            mcp_connections: HashMap::new(),
-            mcp_tools: HashMap::new(),
+            mcp_connections: TokioMutex::new(HashMap::new()),
+            mcp_tools: StdMutex::new(HashMap::new()),
             api_keys,
+            tool_usage: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -121,7 +168,62 @@ impl ToolExecutor {
         Ok(Self::new(config, api_keys))
     }
 
-    pub async fn initialize_mcp_servers(&mut self) -> Result<(), anyhow::Error> {
+    /// Calculate delay based on recent tool usage
+    /// Returns delay in milliseconds based on call frequency
+    fn calculate_rate_limit_delay(&self, tool_name: &str) -> u64 {
+        let now = Instant::now();
+        const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60); // 1 minute window
+
+        let mut usage_map = self.tool_usage.lock().unwrap();
+
+        // Get or create usage entry
+        let usage = usage_map.entry(tool_name.to_string())
+            .or_insert(ToolUsage {
+                last_call: now,
+                call_count: 0,
+            });
+
+        // Check if we're still in the same time window
+        let elapsed = now.duration_since(usage.last_call);
+
+        if elapsed > RATE_LIMIT_WINDOW {
+            // Reset counter if outside window
+            usage.call_count = 1;
+            usage.last_call = now;
+            debug_println!("[RateLimit] {} - First call in new window", tool_name);
+            return 0; // No delay for first call in window
+        }
+
+        // Within window - increment counter and calculate delay
+        usage.call_count += 1;
+        usage.last_call = now;
+
+        // Progressive delay: 0ms, 200ms, 500ms, 1000ms, 2000ms, then cap at 3000ms
+        let delay_ms = match usage.call_count {
+            1 => 0,
+            2 => 200,
+            3 => 500,
+            4 => 1000,
+            5 => 2000,
+            _ => 3000, // Cap at 3 seconds
+        };
+
+        debug_println!("[RateLimit] {} - Call #{} in window, delay: {}ms",
+                      tool_name, usage.call_count, delay_ms);
+
+        delay_ms
+    }
+
+    /// Apply rate limiting delay before tool execution
+    async fn apply_rate_limit(&self, tool_name: &str) {
+        let delay_ms = self.calculate_rate_limit_delay(tool_name);
+        if delay_ms > 0 {
+            debug_println!("[RateLimit] Waiting {}ms before calling {}", delay_ms, tool_name);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+
+    pub async fn initialize_mcp_servers(&self) -> Result<(), anyhow::Error> {
         let servers = self.config.tools.mcp.clone();
         if servers.is_empty() {
             debug_println!("[MCP] No MCP servers configured");
@@ -139,7 +241,7 @@ impl ToolExecutor {
         Ok(())
     }
 
-    async fn connect_mcp_server(&mut self, server: McpServer) -> Result<(), anyhow::Error> {
+    async fn connect_mcp_server(&self, server: McpServer) -> Result<(), anyhow::Error> {
         if server.transport != "stdio" {
             return Err(anyhow::anyhow!("Unsupported transport: {}", server.transport));
         }
@@ -183,7 +285,7 @@ impl ToolExecutor {
             stdout,
         };
 
-        self.mcp_connections.insert(server.name.clone(), connection);
+        self.mcp_connections.lock().await.insert(server.name.clone(), connection);
 
         // Send initialization message
         self.initialize_mcp_connection(&server.name).await?;
@@ -191,7 +293,7 @@ impl ToolExecutor {
         Ok(())
     }
 
-    async fn initialize_mcp_connection(&mut self, server_name: &str) -> Result<(), anyhow::Error> {
+    async fn initialize_mcp_connection(&self, server_name: &str) -> Result<(), anyhow::Error> {
         let init_message = json!({
             "jsonrpc": "2.0",
             "method": "initialize",
@@ -231,7 +333,7 @@ impl ToolExecutor {
                     for tool in &tools {
                         debug_println!("[MCP]   • {}: {}", tool.name, tool.description.as_ref().unwrap_or(&"No description".to_string()));
                     }
-                    self.mcp_tools.insert(server_name.to_string(), tools);
+                    self.mcp_tools.lock().unwrap().insert(server_name.to_string(), tools);
                 } else {
                     debug_println!("[MCP] Failed to parse tools from response");
                 }
@@ -241,9 +343,11 @@ impl ToolExecutor {
         Ok(())
     }
 
-    async fn send_mcp_message(&mut self, server_name: &str, message: &Value) -> Result<(), anyhow::Error> {
+    async fn send_mcp_message(&self, server_name: &str, message: &Value) -> Result<(), anyhow::Error> {
         debug_println!("[MCP] Sending message to {}: {}", server_name, message);
-        let connection = self.mcp_connections.get_mut(server_name)
+
+        let mut connections = self.mcp_connections.lock().await;
+        let connection = connections.get_mut(server_name)
             .ok_or_else(|| anyhow::anyhow!("MCP server {} not connected", server_name))?;
 
         let msg_str = message.to_string();
@@ -255,9 +359,11 @@ impl ToolExecutor {
         Ok(())
     }
 
-    async fn read_mcp_response(&mut self, server_name: &str) -> Result<Value, anyhow::Error> {
+    async fn read_mcp_response(&self, server_name: &str) -> Result<Value, anyhow::Error> {
         debug_println!("[MCP] Reading response from: {}", server_name);
-        let connection = self.mcp_connections.get_mut(server_name)
+
+        let mut connections = self.mcp_connections.lock().await;
+        let connection = connections.get_mut(server_name)
             .ok_or_else(|| anyhow::anyhow!("MCP server {} not connected", server_name))?;
 
         // Keep reading lines until we get a valid JSON response
@@ -397,6 +503,9 @@ impl ToolExecutor {
 
     pub async fn execute_http_tool(&self, tool_name: &str, params: HashMap<String, String>)
         -> Result<Value, anyhow::Error> {
+
+        // Apply rate limiting
+        self.apply_rate_limit(tool_name).await;
 
         debug_println!("[HTTP] Executing tool: {} with params: {:?}", tool_name, params);
         let tool = self.config.tools.http.iter()
@@ -540,13 +649,35 @@ impl ToolExecutor {
             _ => unreachable!(),
         };
 
-        debug_println!("[HTTP] Response status: {}", response.status());
+        let status_code = response.status().as_u16();
+        debug_println!("[HTTP] Response status: {}", status_code);
 
-        if !response.status().is_success() {
+        // Check if status is in acceptable_status list (should be ignored)
+        if status_in_list(status_code, &tool.acceptable_status) {
+            debug_println!("[HTTP] Status {} is acceptable, ignoring response", status_code);
+            return Ok(json!({"status": "ignored", "status_code": status_code}));
+        }
+
+        // Check if status is in expected_status list
+        let is_expected = status_in_list(status_code, &tool.expected_status);
+
+        // Determine if we should throw an error
+        let should_error = if !tool.error_status.is_empty() {
+            // If error_status is specified, only error on those codes
+            status_in_list(status_code, &tool.error_status)
+        } else {
+            // Otherwise, error on any non-expected status
+            !is_expected
+        };
+
+        if should_error {
             let status = response.status();
             let error_body = response.text().await.unwrap_or_else(|_| "Could not read error response".to_string());
             debug_println!("[HTTP] Error response body: {}", error_body);
-            return Err(anyhow::anyhow!("HTTP {} error: {}", status, error_body));
+            return Err(anyhow::anyhow!(
+                "HTTP {} error for tool '{}':\nStatus: {}\nResponse:\n{}",
+                status_code, tool_name, status, error_body
+            ));
         }
 
         let mut result = match tool.response_format.as_str() {
@@ -563,8 +694,12 @@ impl ToolExecutor {
         Ok(result)
     }
 
-    pub async fn execute_mcp_tool(&mut self, server_name: &str, tool_name: &str, params: Value)
+    pub async fn execute_mcp_tool(&self, server_name: &str, tool_name: &str, params: Value)
         -> Result<Value, anyhow::Error> {
+
+        // Apply rate limiting using combined name
+        let rate_limit_key = format!("{}:{}", server_name, tool_name);
+        self.apply_rate_limit(&rate_limit_key).await;
 
         debug_println!("[MCP] Executing tool '{}' on server: {}", tool_name, server_name);
 
@@ -614,7 +749,8 @@ impl ToolExecutor {
         }
 
         // MCP tools - include actual discovered tools
-        for (server_name, tools) in &self.mcp_tools {
+        let mcp_tools = self.mcp_tools.lock().unwrap();
+        for (server_name, tools) in mcp_tools.iter() {
             for tool in tools {
                 descriptions.push(ToolDescription {
                     name: format!("{}:{}", server_name, tool.name),  // Prefix with server name

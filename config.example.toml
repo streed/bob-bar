@@ -1,5 +1,4 @@
-# bob-bar Configuration Example
-# Copy this file to config.toml and customize as needed
+# bob-bar Configuration
 
 # Ollama server configuration
 [ollama]
@@ -12,9 +11,8 @@ host = "http://localhost:11434"
 # See available models: ollama list
 model = "llama2"
 
-# Vision model to use for analyzing screenshots
-# Options: llama3.2-vision:11b, llava, llava:13b, bakllava, etc.
-# See available models: ollama list
+# Model to use for vision/screenshot analysis
+# Default: llama3.2-vision:11b
 vision_model = "llama3.2-vision:11b"
 
 # Maximum number of tool iterations per query
@@ -22,12 +20,15 @@ vision_model = "llama3.2-vision:11b"
 # Default: 5
 max_tool_turns = 5
 
-# Window configuration
-[window]
-# Initial window dimensions (in pixels)
-width = 1200
-height = 1200
+# Research mode configuration
+[research]
+# Maximum number of refinement iterations in the critic-refiner loop
+# The critic evaluates output quality and the refiner improves it
+# Loop stops when critic approves OR max iterations reached
+# Default: 5
+max_refinement_iterations = 5
 
-# Minimum window size (in pixels)
-min_width = 400
-min_height = 300
+# Number of worker agents to spawn for parallel research
+# Workers research different sub-questions concurrently
+# Default: 3
+worker_count = 3

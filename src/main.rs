@@ -5,6 +5,7 @@ mod history;
 mod ollama;
 mod tools;
 mod screenshot;
+mod research;
 
 use iced::{
     widget::{column, row, container, scrollable, text, text_input, button, text_input::Id, rich_text, span, text_editor, Space},
@@ -495,7 +496,7 @@ fn main() -> iced::Result {
             .theme(App::theme)
             .subscription(App::subscription)
             .window(window::Settings {
-                size: iced::Size::new(config.window.width as f32, config.window.height as f32),
+                size: iced::Size::new(1200.0, 1200.0),
                 position: window::Position::Centered,
                 // Use a normal window level so it does not stay above others
                 level: Level::Normal,
@@ -511,12 +512,12 @@ fn main() -> iced::Result {
     }
 }
 
-fn run_screenshot_mode(config: config::Config) -> iced::Result {
+fn run_screenshot_mode(_config: config::Config) -> iced::Result {
     iced::application("bob-bar", App::update, App::view)
         .theme(App::theme)
         .subscription(App::subscription)
         .window(window::Settings {
-            size: iced::Size::new(config.window.width as f32, config.window.height as f32),
+            size: iced::Size::new(1200.0, 1200.0),
             position: window::Position::Centered,
             // Screenshot mode should also not force always-on-top
             level: Level::Normal,
@@ -562,6 +563,8 @@ enum Message {
     HistoryDelete(usize),
     ToggleSelectMode,
     OutputEditorAction(text_editor::Action),
+    ToggleResearchMode,
+    ResearchProgress(research::ResearchProgress),
 }
 
 struct App {
@@ -580,6 +583,10 @@ struct App {
     selected_history: Option<usize>,
     select_mode: bool,
     output_editor: text_editor::Content,
+    research_mode: bool,
+    research_orchestrator: Option<Arc<Mutex<research::ResearchOrchestrator>>>,
+    research_progress: Option<String>,
+    research_start_time: Option<std::time::Instant>,
 }
 
 impl App {
@@ -623,7 +630,7 @@ impl App {
                         tokio::runtime::Runtime::new()
                             .expect("Failed to create Tokio runtime")
                             .block_on(async {
-                                let mut exec = executor_clone.lock().await;
+                                let exec = executor_clone.lock().await;
                                 if let Err(e) = exec.initialize_mcp_servers().await {
                                     eprintln!("Warning: Failed to initialize MCP servers: {}", e);
                                 }
@@ -647,13 +654,53 @@ impl App {
             config.ollama.model,
         );
 
-        if let Some(executor) = tool_executor {
-            ollama_client.set_tool_executor(executor);
-        }
+        let tool_executor_clone = if let Some(ref executor) = tool_executor {
+            ollama_client.set_tool_executor(executor.clone());
+            Some(executor.clone())
+        } else {
+            None
+        };
 
         let input_id = Id::unique();
 
         let vision_model = config.ollama.vision_model.clone();
+
+        let ollama_client_arc = Arc::new(Mutex::new(ollama_client));
+
+        // Initialize research orchestrator
+        let agents_path = config::Config::get_config_dir().join("agents.json");
+        let research_orchestrator = if agents_path.exists() {
+            match research::ResearchOrchestrator::from_file(
+                &agents_path,
+                ollama_client_arc.clone(),
+                config.ollama.context_window
+            ) {
+                Ok(mut orchestrator) => {
+                    // Override with config.toml settings
+                    orchestrator.override_config(&config.research);
+
+                    if let Some(executor) = tool_executor_clone {
+                        orchestrator.set_tool_executor(executor);
+                    }
+                    if DEBUG_MODE.load(Ordering::Relaxed) {
+                        eprintln!("=== Research Mode ===");
+                        eprintln!("Research orchestrator initialized from: {}", agents_path.display());
+                        eprintln!("Context window: {} tokens", config.ollama.context_window);
+                        eprintln!("Max refinement iterations: {}", config.research.max_refinement_iterations);
+                        eprintln!("Worker count: {}", config.research.worker_count);
+                        eprintln!("=====================\n");
+                    }
+                    Some(Arc::new(Mutex::new(orchestrator)))
+                }
+                Err(e) => {
+                    eprintln!("Warning: Could not load research config: {}", e);
+                    None
+                }
+            }
+        } else {
+            eprintln!("Info: agents.json not found. Research mode will be unavailable.");
+            None
+        };
 
         let app = App {
             input_text: String::new(),
@@ -662,7 +709,7 @@ impl App {
             is_loading: false,
             is_fullscreen: false,
             loading_frame: 0,
-            ollama_client: Arc::new(Mutex::new(ollama_client)),
+            ollama_client: ollama_client_arc,
             input_id: input_id.clone(),
             screenshot_mode: false,
             screenshot_path: None,
@@ -674,6 +721,10 @@ impl App {
             selected_history: None,
             select_mode: false,
             output_editor: text_editor::Content::with_text(""),
+            research_mode: false,
+            research_orchestrator,
+            research_progress: None,
+            research_start_time: None,
         };
 
         let focus_task = text_input::focus(input_id);
@@ -692,7 +743,6 @@ impl App {
                     return Task::none();
                 }
 
-                let prompt = format!("{}\n\n{}", TABLE_PLAIN_TEXT_RULES, self.input_text.clone());
                 self.is_loading = true;
                 self.response_text = String::new();
                 self.streaming_text = String::new();
@@ -706,29 +756,67 @@ impl App {
                     });
                 }
 
-                let client = self.ollama_client.clone();
+                // Check if research mode is enabled
+                if self.research_mode && self.research_orchestrator.is_some() {
+                    self.research_start_time = Some(std::time::Instant::now());
+                    self.research_progress = Some("Starting research...".to_string());
 
-                // Use Iced's Task system to run async work non-blocking
-                // This spawns the async work on Iced's tokio runtime thread pool,
-                // keeping the main GUI thread responsive to Wayland events
-                Task::perform(
-                    async move {
-                        let mut client_guard = client.lock().await;
-                        client_guard.query_streaming(&prompt, |_text| {
-                            // For now, we'll skip streaming updates to keep it simple
-                            // We could implement this with a subscription if needed
-                        }).await
-                    },
-                    |result| match result {
-                        Ok(response) => Message::ResponseReceived(response),
-                        Err(e) => Message::Error(format!("Error: {}", e)),
+                    let query = self.input_text.clone();
+                    let orchestrator = self.research_orchestrator.clone().unwrap();
+
+                    // Create progress channel
+                    use tokio::sync::mpsc;
+                    let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+
+                    // Set up the progress channel in the orchestrator
+                    {
+                        let orch_clone = orchestrator.clone();
+                        tokio::task::spawn(async move {
+                            let mut orch = orch_clone.lock().await;
+                            orch.set_progress_channel(progress_tx);
+                        });
                     }
-                )
+
+                    // Just run the research task - progress will update via Tick
+                    Task::perform(
+                        async move {
+                            let mut orch = orchestrator.lock().await;
+                            orch.research(&query).await
+                        },
+                        |result| match result {
+                            Ok(response) => Message::ResponseReceived(response),
+                            Err(e) => Message::Error(format!("Research error: {}", e)),
+                        }
+                    )
+                } else {
+                    // Normal mode
+                    let prompt = format!("{}\n\n{}", TABLE_PLAIN_TEXT_RULES, self.input_text.clone());
+                    let client = self.ollama_client.clone();
+
+                    // Use Iced's Task system to run async work non-blocking
+                    // This spawns the async work on Iced's tokio runtime thread pool,
+                    // keeping the main GUI thread responsive to Wayland events
+                    Task::perform(
+                        async move {
+                            let mut client_guard = client.lock().await;
+                            client_guard.query_streaming(&prompt, |_text| {
+                                // For now, we'll skip streaming updates to keep it simple
+                                // We could implement this with a subscription if needed
+                            }).await
+                        },
+                        |result| match result {
+                            Ok(response) => Message::ResponseReceived(response),
+                            Err(e) => Message::Error(format!("Error: {}", e)),
+                        }
+                    )
+                }
             }
             Message::ResponseReceived(response) => {
                 self.response_text = response;
                 self.streaming_text = String::new();
                 self.is_loading = false;
+                self.research_progress = None;
+                self.research_start_time = None;
 
                 if ENABLE_NOTIFICATIONS {
                     std::thread::spawn(|| {
@@ -791,6 +879,32 @@ impl App {
                 if self.select_mode {
                     self.output_editor = text_editor::Content::with_text(&self.response_text);
                 }
+                Task::none()
+            }
+            Message::ToggleResearchMode => {
+                if self.research_orchestrator.is_some() {
+                    self.research_mode = !self.research_mode;
+                }
+                Task::none()
+            }
+            Message::ResearchProgress(progress) => {
+                use research::ResearchProgress;
+
+                let progress_text = match progress {
+                    ResearchProgress::Started => "Starting research...".to_string(),
+                    ResearchProgress::Decomposing => "Decomposing query into sub-questions...".to_string(),
+                    ResearchProgress::WorkersStarted(n) => format!("Dispatching {} research workers...", n),
+                    ResearchProgress::WorkerCompleted(name) => format!("✓ {} completed", name),
+                    ResearchProgress::Combining => "Combining research results...".to_string(),
+                    ResearchProgress::CriticReviewing => "Critic reviewing output...".to_string(),
+                    ResearchProgress::Refining(current, max) => format!("Refining output (iteration {}/{})", current, max),
+                    ResearchProgress::AddingBibliography => "Generating bibliography...".to_string(),
+                    ResearchProgress::WritingDocument(current, max) => format!("Writing document (iteration {}/{})", current, max),
+                    ResearchProgress::DocumentReviewing => "Document critic reviewing...".to_string(),
+                    ResearchProgress::Completed => "Research complete!".to_string(),
+                };
+
+                self.research_progress = Some(progress_text);
                 Task::none()
             }
             Message::HistoryDelete(idx) => {
@@ -936,6 +1050,52 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                 .on_submit(Message::Submit);
         }
 
+        // Research mode toggle button (only show if orchestrator is available)
+        let research_toggle = if self.research_orchestrator.is_some() {
+            let toggle_text = if self.research_mode {
+                "Research: ON "  // Extra space to match OFF length
+            } else {
+                "Research: OFF"
+            };
+
+            let toggle_btn = if self.is_loading {
+                button(
+                    container(text(toggle_text).size(14))
+                        .align_x(alignment::Horizontal::Center)
+                        .align_y(alignment::Vertical::Center)
+                        .width(Length::Fixed(110.0))
+                        .height(Length::Fill)
+                )
+                .padding([8, 12])
+                .height(Length::Fixed(INPUT_HEIGHT))
+            } else {
+                button(
+                    container(text(toggle_text).size(14))
+                        .align_x(alignment::Horizontal::Center)
+                        .align_y(alignment::Vertical::Center)
+                        .width(Length::Fixed(110.0))
+                        .height(Length::Fill)
+                )
+                .on_press(Message::ToggleResearchMode)
+                .padding([8, 12])
+                .height(Length::Fixed(INPUT_HEIGHT))
+            };
+
+            Some(toggle_btn)
+        } else {
+            None
+        };
+
+        // Create input row with toggle
+        let input_row = if let Some(toggle) = research_toggle {
+            row![input, toggle]
+                .spacing(8)
+                .width(Length::Fill)
+        } else {
+            row![input]
+                .width(Length::Fill)
+        };
+
         let output: Element<Message> = if self.is_loading {
             // Show streaming text if available, otherwise show loading spinner
             if !self.streaming_text.is_empty() {
@@ -946,6 +1106,29 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                 )
                 .direction(Direction::Vertical(Scrollbar::default()))
                 .height(Length::Fill)
+                .into()
+            } else if let Some(ref progress_text) = self.research_progress {
+                // Show research progress with elapsed time
+                let elapsed = if let Some(start_time) = self.research_start_time {
+                    let duration = start_time.elapsed();
+                    format!("{}s", duration.as_secs())
+                } else {
+                    "0s".to_string()
+                };
+
+                container(
+                    column![
+                        text("🔬 Research Mode").size(24),
+                        text(progress_text).size(18),
+                        text(format!("Elapsed: {}", elapsed)).size(14)
+                    ]
+                    .spacing(15)
+                    .align_x(alignment::Horizontal::Center)
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(alignment::Horizontal::Center)
+                .align_y(alignment::Vertical::Center)
                 .into()
             } else {
                 // Show animated loading text with a more elegant ASCII spinner (bouncing star)
@@ -1026,7 +1209,7 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
             }
         };
 
-        let mut content_column = column![input, output]
+        let mut content_column = column![input_row, output]
             .spacing(10)
             // Equal left/right padding (horizontal=3), vertical=10
             .padding(Padding::from([10, 3]));

@@ -199,7 +199,16 @@ impl OllamaClient {
             iteration += 1;
 
             if iteration > max_iterations {
-                return Ok(format!("Maximum tool iteration limit ({}) reached. Last response: {}", max_iterations, prompt_for_iteration));
+                // Return accumulated context instead of error message
+                if !tool_results_context.is_empty() {
+                    debug_eprintln!("[Tool] Maximum iteration limit ({}) reached. Returning accumulated context.", max_iterations);
+                    return Ok(format!(
+                        "Based on the research gathered:\n\n{}\n\nNote: Reached maximum tool iteration limit. The above represents all gathered information.",
+                        tool_results_context
+                    ));
+                } else {
+                    return Ok(format!("Maximum tool iteration limit ({}) reached before gathering results.", max_iterations));
+                }
             }
 
             // Build prompt with tool descriptions if available and allowed
@@ -276,15 +285,83 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
             tools: None,
         };
 
-        let response = self.client
-            .post(format!("{}/api/chat", self.base_url))
-            .json(&request)
-            .send()
-            .await?;
+        // Retry logic: try up to 10 times on non-2xx status codes
+        let mut last_error = None;
+        let mut response = None;
 
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Ollama API error: {}", response.status()));
+        for attempt in 1..=10 {
+            let req_response = self.client
+                .post(format!("{}/api/chat", self.base_url))
+                .json(&request)
+                .send()
+                .await;
+
+            match req_response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        response = Some(resp);
+                        break;
+                    } else {
+                        // For 400 errors, print full response body for debugging
+                        if status.as_u16() == 400 {
+                            let error_body = resp.text().await.unwrap_or_else(|_| "Could not read response body".to_string());
+                            let error_msg = format!("Ollama API 400 Bad Request (attempt {}/10):\n{}", attempt, error_body);
+                            eprintln!("{}", error_msg);
+                            last_error = Some(error_msg);
+                        } else {
+                            let error_msg = format!("Ollama API error: {} (attempt {}/10)", status, attempt);
+                            eprintln!("{}", error_msg);
+                            last_error = Some(error_msg);
+                        }
+
+                        // Wait before retrying (progressive backoff: 2s, 5s, 10s, 15s, 20s, 25s, 30s, 35s, 40s)
+                        if attempt < 10 {
+                            let delay_secs = match attempt {
+                                1 => 2,
+                                2 => 5,
+                                3 => 10,
+                                4 => 15,
+                                5 => 20,
+                                6 => 25,
+                                7 => 30,
+                                8 => 35,
+                                9 => 40,
+                                _ => 40,
+                            };
+                            tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+                        }
+                    }
+                },
+                Err(e) => {
+                    let error_msg = format!("Ollama request failed: {} (attempt {}/10)", e, attempt);
+                    eprintln!("{}", error_msg);
+                    last_error = Some(error_msg);
+
+                    // Wait before retrying (progressive backoff: 2s, 5s, 10s, 15s, 20s, 25s, 30s, 35s, 40s)
+                    if attempt < 10 {
+                        let delay_secs = match attempt {
+                            1 => 2,
+                            2 => 5,
+                            3 => 10,
+                            4 => 15,
+                            5 => 20,
+                            6 => 25,
+                            7 => 30,
+                            8 => 35,
+                            9 => 40,
+                            _ => 40,
+                        };
+                        tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+                    }
+                }
+            }
         }
+
+        let response = response.ok_or_else(|| {
+            anyhow::anyhow!("Ollama API failed after 10 attempts. Last error: {}",
+                last_error.unwrap_or_else(|| "Unknown error".to_string()))
+        })?;
 
         let mut response_text = String::new();
 
@@ -435,6 +512,67 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
         }
     }
 
+    /// Summarize a long tool result to reduce token usage (non-recursive version)
+    async fn summarize_tool_result(&self, tool_name: &str, result: &str) -> Result<String> {
+        const MAX_LENGTH: usize = 2000; // Characters threshold for summarization - increased to preserve more detail
+
+        // If result is short enough, return as-is
+        if result.len() <= MAX_LENGTH {
+            return Ok(result.to_string());
+        }
+
+        debug_eprintln!("[Tool] Result from '{}' is {} chars, summarizing...", tool_name, result.len());
+
+        let prompt = format!(
+            "Condense this tool result while keeping all important information:\n\n\
+            - Preserve ALL key facts, data, and specific details\n\
+            - Keep technical information and numbers\n\
+            - Maintain structure and context\n\
+            - Remove only truly redundant content\n\n\
+            Tool result:\n{}",
+            result
+        );
+
+        // Make a direct API call without going through query_internal to avoid recursion
+        let request = OllamaChatRequest {
+            model: self.model.clone(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: prompt,
+                tool_calls: None,
+                images: None,
+            }],
+            stream: false,
+            tools: None,
+        };
+
+        let response = self.client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&request)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<OllamaChatResponse>().await {
+                    Ok(ollama_response) => {
+                        let summary = ollama_response.message.content;
+                        debug_eprintln!("[Tool] Summarized '{}' from {} to {} chars", tool_name, result.len(), summary.len());
+                        Ok(summary)
+                    },
+                    Err(e) => {
+                        debug_eprintln!("[Tool] Failed to parse summarization response: {}", e);
+                        Ok(format!("{}...\n\n[Note: Content truncated due to length]", &result[..MAX_LENGTH]))
+                    }
+                }
+            },
+            _ => {
+                debug_eprintln!("[Tool] Summarization request failed, using truncated version");
+                Ok(format!("{}...\n\n[Note: Content truncated due to length]", &result[..MAX_LENGTH]))
+            }
+        }
+    }
+
     async fn execute_tool_call_get_result(&mut self, tool_call: Value, executor: Arc<Mutex<crate::tools::ToolExecutor>>)
         -> Result<String> {
         // Execute the tool and return a formatted result string
@@ -450,7 +588,7 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
         let parameters = tool_call.get("parameters")
             .ok_or_else(|| anyhow::anyhow!("Missing parameters"))?;
 
-        match tool_type {
+        let raw_result = match tool_type {
             "http" => {
                 // Convert JSON parameters to HashMap<String, String>
                 let params: std::collections::HashMap<String, String> = if let Some(obj) = parameters.as_object() {
@@ -484,14 +622,17 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
                 match executor.execute_http_tool(tool_name, params.clone()).await {
                     Ok(result) => {
                         let result_str = serde_json::to_string_pretty(&result)?;
-                        // Return formatted result
-                        Ok(format!(
+
+                        // Summarize if too long
+                        let summarized_result = self.summarize_tool_result(tool_name, &result_str).await?;
+
+                        format!(
                             "Tool '{}' was called with:\n{}\n\nAnd returned:\n{}",
-                            tool_name, params_str, result_str
-                        ))
+                            tool_name, params_str, summarized_result
+                        )
                     },
                     Err(e) => {
-                        Ok(format!("Tool '{}' failed with error: {}", tool_name, e))
+                        format!("Tool '{}' failed with error: {}", tool_name, e)
                     }
                 }
             },
@@ -514,23 +655,28 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
                 // Format parameters for display
                 let params_str = serde_json::to_string_pretty(&parameters)?;
 
-                let mut executor = executor.lock().await;
+                let executor = executor.lock().await;
                 match executor.execute_mcp_tool(&server_name, actual_tool_name, parameters.clone()).await {
                     Ok(result) => {
                         let result_str = serde_json::to_string_pretty(&result)?;
-                        // Return formatted result
-                        Ok(format!(
+
+                        // Summarize if too long
+                        let summarized_result = self.summarize_tool_result(tool_name, &result_str).await?;
+
+                        format!(
                             "MCP tool '{}' was called with:\n{}\n\nAnd returned:\n{}",
-                            tool_name, params_str, result_str
-                        ))
+                            tool_name, params_str, summarized_result
+                        )
                     },
                     Err(e) => {
-                        Ok(format!("MCP tool '{}' failed with error: {}", tool_name, e))
+                        format!("MCP tool '{}' failed with error: {}", tool_name, e)
                     }
                 }
             },
-            _ => Err(anyhow::anyhow!("Unknown tool type: {}", tool_type))?
-        }
+            _ => return Err(anyhow::anyhow!("Unknown tool type: {}", tool_type))
+        };
+
+        Ok(raw_result)
     }
 
     #[allow(dead_code)]
@@ -616,7 +762,7 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
                 // Format parameters for display
                 let params_str = serde_json::to_string_pretty(&parameters)?;
 
-                let mut executor = executor.lock().await;
+                let executor = executor.lock().await;
                 match executor.execute_mcp_tool(&server_name, actual_tool_name, parameters.clone()).await {
                     Ok(result) => {
                         let result_str = serde_json::to_string_pretty(&result)?;

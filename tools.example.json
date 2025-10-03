@@ -10,7 +10,10 @@
           "q": "{{city}}",
           "appid": "$OPENWEATHER_API_KEY",
           "units": "metric"
-        }
+        },
+        "expected_status": ["2xx"],
+        "acceptable_status": ["404"],
+        "error_status": []
       },
       {
         "name": "search",
@@ -22,7 +25,9 @@
         },
         "parameters": {
           "q": "{{query}}"
-        }
+        },
+        "expected_status": ["2xx", "3xx"],
+        "error_status": ["401", "403", "5xx"]
       },
       {
         "name": "github_user",
@@ -32,7 +37,10 @@
         "headers": {
           "Authorization": "token $GITHUB_TOKEN",
           "Accept": "application/vnd.github.v3+json"
-        }
+        },
+        "expected_status": ["200", "201"],
+        "acceptable_status": ["404"],
+        "error_status": ["4xx", "5xx"]
       }
     ],
     "mcp": []

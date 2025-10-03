@@ -18,3 +18,4 @@ futures-util = "0.3"
 notify-rust = "4.11"
 rusqlite = { version = "0.31", features = ["bundled"] }
 unicode-width = "0.1"
+regex = "1.10"

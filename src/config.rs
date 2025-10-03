@@ -6,10 +6,27 @@ fn default_max_tool_turns() -> usize {
     5
 }
 
+fn default_context_window() -> usize {
+    128000
+}
+
+fn default_max_refinement_iterations() -> usize {
+    5
+}
+
+fn default_max_document_iterations() -> usize {
+    3
+}
+
+fn default_worker_count() -> usize {
+    3
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     pub ollama: OllamaConfig,
-    pub window: WindowConfig,
+    #[serde(default)]
+    pub research: ResearchConfig,
 }
 
 fn default_vision_model() -> String {
@@ -22,16 +39,30 @@ pub struct OllamaConfig {
     pub model: String,
     #[serde(default = "default_vision_model")]
     pub vision_model: String,
+    #[serde(default = "default_context_window")]
+    pub context_window: usize,
     #[serde(default = "default_max_tool_turns")]
     pub max_tool_turns: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct WindowConfig {
-    pub width: u32,
-    pub height: u32,
-    pub min_width: u32,
-    pub min_height: u32,
+pub struct ResearchConfig {
+    #[serde(default = "default_max_refinement_iterations")]
+    pub max_refinement_iterations: usize,
+    #[serde(default = "default_max_document_iterations")]
+    pub max_document_iterations: usize,
+    #[serde(default = "default_worker_count")]
+    pub worker_count: usize,
+}
+
+impl Default for ResearchConfig {
+    fn default() -> Self {
+        ResearchConfig {
+            max_refinement_iterations: 5,
+            max_document_iterations: 3,
+            worker_count: 3,
+        }
+    }
 }
 
 impl Default for Config {
@@ -41,14 +72,10 @@ impl Default for Config {
                 host: "http://localhost:11434".to_string(),
                 model: "llama2".to_string(),
                 vision_model: "llama3.2-vision:11b".to_string(),
+                context_window: 128000,
                 max_tool_turns: 5,
             },
-            window: WindowConfig {
-                width: 752,  // Approximately 1/3 of typical screen width
-                height: 600,
-                min_width: 400,
-                min_height: 300,
-            },
+            research: ResearchConfig::default(),
         }
     }
 }
