@@ -53,7 +53,6 @@ pub struct ResearchConfig {
     pub max_document_iterations: usize,
     pub worker_count: usize,
     pub max_debate_rounds: usize,
-    pub enable_parallel_workers: bool,
 }
 
 impl Default for ResearchConfig {
@@ -63,7 +62,6 @@ impl Default for ResearchConfig {
             max_document_iterations: 3,
             worker_count: 3,
             max_debate_rounds: 2,
-            enable_parallel_workers: true,
         }
     }
 }
