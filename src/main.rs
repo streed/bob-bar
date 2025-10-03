@@ -653,6 +653,7 @@ impl App {
             config.ollama.host,
             config.ollama.model.clone(),
         );
+        ollama_client.set_max_tool_turns(config.ollama.max_tool_turns);
 
         let tool_executor_clone = if let Some(ref executor) = tool_executor {
             ollama_client.set_tool_executor(executor.clone());
@@ -677,7 +678,8 @@ impl App {
                 &agents_path,
                 ollama_client_arc.clone(),
                 config.ollama.context_window,
-                research_model.clone()
+                research_model.clone(),
+                config.ollama.max_tool_turns
             ) {
                 Ok(mut orchestrator) => {
                     // Override with config.toml settings
@@ -770,19 +772,34 @@ impl App {
                     let query = self.input_text.clone();
                     let orchestrator = self.research_orchestrator.clone().unwrap();
 
-                    // Create progress channel
+                    // For now, research progress updates are visible in terminal via eprintln
+                    // Future enhancement: implement subscription-based progress streaming to UI
                     use tokio::sync::mpsc;
                     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
 
-                    // Spawn a task to listen for progress updates
+                    // Spawn task to monitor progress and print to terminal
                     tokio::spawn(async move {
+                        use research::ResearchProgress;
                         while let Some(progress) = progress_rx.recv().await {
-                            // Progress updates will show in debug output via eprintln in research.rs
-                            let _ = progress; // Acknowledge we received it
+                            let msg = match progress {
+                                ResearchProgress::Started => "Starting research...".to_string(),
+                                ResearchProgress::Decomposing => "Decomposing query into sub-questions...".to_string(),
+                                ResearchProgress::WorkersStarted(n) => format!("Dispatching {} research workers...", n),
+                                ResearchProgress::WorkerCompleted(name) => format!("✓ {} completed", name),
+                                ResearchProgress::Combining => "Combining research results...".to_string(),
+                                ResearchProgress::CriticReviewing => "Critic reviewing output...".to_string(),
+                                ResearchProgress::DebateRound(current, max) => format!("Debate round {}/{} in progress...", current, max),
+                                ResearchProgress::Refining(current, max) => format!("Refining output (iteration {}/{})", current, max),
+                                ResearchProgress::AddingBibliography => "Generating bibliography...".to_string(),
+                                ResearchProgress::WritingDocument(current, max) => format!("Writing document (iteration {}/{})", current, max),
+                                ResearchProgress::DocumentReviewing => "Document critic reviewing...".to_string(),
+                                ResearchProgress::Completed => "Research complete!".to_string(),
+                            };
+                            eprintln!("[Research Progress] {}", msg);
                         }
                     });
 
-                    // Run the research task with progress channel
+                    // Run the research task
                     Task::perform(
                         async move {
                             let mut orch = orchestrator.lock().await;

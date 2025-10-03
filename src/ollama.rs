@@ -127,6 +127,7 @@ pub struct OllamaClient {
     client: reqwest::Client,
     tool_executor: Option<Arc<Mutex<ToolExecutor>>>,
     available_tools: Option<Vec<String>>, // Filter to only these tools if specified
+    max_tool_turns: usize,
 }
 
 impl OllamaClient {
@@ -139,7 +140,7 @@ impl OllamaClient {
             .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        OllamaClient { base_url, model, client, tool_executor: None, available_tools: None }
+        OllamaClient { base_url, model, client, tool_executor: None, available_tools: None, max_tool_turns: 5 }
     }
 
     pub fn with_config(base_url: String, model: String) -> Self {
@@ -147,7 +148,11 @@ impl OllamaClient {
             .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        OllamaClient { base_url, model, client, tool_executor: None, available_tools: None }
+        OllamaClient { base_url, model, client, tool_executor: None, available_tools: None, max_tool_turns: 5 }
+    }
+
+    pub fn set_max_tool_turns(&mut self, max_turns: usize) {
+        self.max_tool_turns = max_turns;
     }
 
     pub fn set_tool_executor(&mut self, executor: Arc<Mutex<ToolExecutor>>) {
@@ -187,7 +192,8 @@ impl OllamaClient {
     where
         F: FnMut(String) + Send,
     {
-        self.query_internal_with_iterations(initial_prompt, allow_tools, image, callback, 5).await
+        let max_iterations = self.max_tool_turns;
+        self.query_internal_with_iterations(initial_prompt, allow_tools, image, callback, max_iterations).await
     }
 
     async fn query_internal_with_iterations<F>(&mut self, initial_prompt: &str, allow_tools: bool, image: Option<String>, mut callback: Option<&mut F>, max_iterations: usize) -> Result<String>
@@ -221,9 +227,12 @@ impl OllamaClient {
             let executor = self.tool_executor.as_ref().unwrap().lock().await;
             let mut tools = executor.get_tool_descriptions();
 
-            // Filter tools if available_tools is specified
+            // Filter tools if available_tools is specified and non-empty
+            // Empty list means no filtering (all tools visible)
             if let Some(ref allowed) = self.available_tools {
-                tools.retain(|tool| allowed.contains(&tool.name));
+                if !allowed.is_empty() {
+                    tools.retain(|tool| allowed.contains(&tool.name));
+                }
             }
 
             if !tools.is_empty() {
@@ -599,7 +608,23 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
         let parameters = tool_call.get("parameters")
             .ok_or_else(|| anyhow::anyhow!("Missing parameters"))?;
 
-        let raw_result = match tool_type {
+        // If tool_type is not one of the standard categories, look up the tool by name to find its real type
+        let actual_tool_type: String = if matches!(tool_type, "builtin" | "http" | "mcp") {
+            tool_type.to_string()
+        } else {
+            // Look up the tool in the executor to find its real type
+            let exec = executor.lock().await;
+            let tool_descriptions = exec.get_tool_descriptions();
+
+            if let Some(tool_desc) = tool_descriptions.iter().find(|t| t.name == tool_name) {
+                debug_eprintln!("[Tool] Resolved '{}': {} -> {}", tool_name, tool_type, tool_desc.tool_type);
+                tool_desc.tool_type.clone()
+            } else {
+                tool_type.to_string()
+            }
+        };
+
+        let raw_result = match actual_tool_type.as_str() {
             "builtin" => {
                 // Convert JSON parameters to HashMap<String, String>
                 let params: std::collections::HashMap<String, String> = if let Some(obj) = parameters.as_object() {

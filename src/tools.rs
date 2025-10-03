@@ -691,6 +691,9 @@ impl ToolExecutor {
         if should_error {
             let status = response.status();
             let error_body = response.text().await.unwrap_or_else(|_| "Could not read error response".to_string());
+            // Always log HTTP error responses to console for debugging
+            eprintln!("[HTTP Tool Error] Tool: {} | Status: {} | Response Body:\n{}",
+                tool_name, status_code, error_body);
             debug_println!("[HTTP] Error response body: {}", error_body);
             return Err(anyhow::anyhow!(
                 "HTTP {} error for tool '{}':\nStatus: {}\nResponse:\n{}",

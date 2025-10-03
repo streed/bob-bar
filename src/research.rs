@@ -88,10 +88,11 @@ pub struct ResearchOrchestrator {
     progress_tx: Option<mpsc::UnboundedSender<ResearchProgress>>,
     context_window: usize,
     research_model: String,
+    max_tool_turns: usize,
 }
 
 impl ResearchOrchestrator {
-    pub fn new(config: AgentsConfig, base_client: Arc<Mutex<OllamaClient>>, context_window: usize, research_model: String) -> Self {
+    pub fn new(config: AgentsConfig, base_client: Arc<Mutex<OllamaClient>>, context_window: usize, research_model: String, max_tool_turns: usize) -> Self {
         Self {
             config,
             base_client,
@@ -99,13 +100,14 @@ impl ResearchOrchestrator {
             progress_tx: None,
             context_window,
             research_model,
+            max_tool_turns,
         }
     }
 
-    pub fn from_file(path: &std::path::Path, base_client: Arc<Mutex<OllamaClient>>, context_window: usize, research_model: String) -> Result<Self> {
+    pub fn from_file(path: &std::path::Path, base_client: Arc<Mutex<OllamaClient>>, context_window: usize, research_model: String, max_tool_turns: usize) -> Result<Self> {
         let config_str = std::fs::read_to_string(path)?;
         let config: AgentsConfig = serde_json::from_str(&config_str)?;
-        Ok(Self::new(config, base_client, context_window, research_model))
+        Ok(Self::new(config, base_client, context_window, research_model, max_tool_turns))
     }
 
     /// Override config values from global config.toml
@@ -174,6 +176,7 @@ impl ResearchOrchestrator {
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
         let mut lead_client = OllamaClient::with_config(base_url, self.research_model.clone());
+        lead_client.set_max_tool_turns(self.max_tool_turns);
 
         let response = lead_client.query_streaming(&prompt, |_| {}).await?;
 
@@ -187,6 +190,15 @@ impl ResearchOrchestrator {
         }
 
         let assignments: Vec<QuestionAssignment> = serde_json::from_str(&cleaned)?;
+
+        // Log the planner's decisions in debug mode
+        if std::env::var("BOBBAR_DEBUG").is_ok() {
+            eprintln!("\n[Research Planner] Decomposed query into {} sub-questions:", assignments.len());
+            for (i, assignment) in assignments.iter().enumerate() {
+                eprintln!("  {}. [{}] {}", i + 1, assignment.worker, assignment.question);
+            }
+            eprintln!();
+        }
 
         // Map worker role to actual worker name
         let mut sub_questions = Vec::new();
@@ -230,6 +242,7 @@ impl ResearchOrchestrator {
             let tool_executor = self.tool_executor.clone();
             let progress_tx = self.progress_tx.clone();
             let research_model = self.research_model.clone();
+            let max_tool_turns = self.max_tool_turns;
 
             let handle = tokio::spawn(async move {
                 let result = Self::execute_worker(
@@ -238,6 +251,7 @@ impl ResearchOrchestrator {
                     base_client,
                     tool_executor,
                     research_model,
+                    max_tool_turns,
                 ).await;
 
                 let worker_result = match result {
@@ -288,6 +302,7 @@ impl ResearchOrchestrator {
         _base_client: Arc<Mutex<OllamaClient>>,
         tool_executor: Option<Arc<Mutex<ToolExecutor>>>,
         research_model: String,
+        max_tool_turns: usize,
     ) -> Result<String> {
         // Add small delay to avoid rate limiting
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -295,7 +310,8 @@ impl ResearchOrchestrator {
         let base_url = std::env::var("OLLAMA_HOST")
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
-        let mut worker_client = OllamaClient::with_config(base_url, research_model);
+        let mut worker_client = OllamaClient::with_config(base_url, research_model.clone());
+        worker_client.set_max_tool_turns(max_tool_turns);
 
         // Set tool executor and available tools if available
         if let Some(executor) = tool_executor {
@@ -341,6 +357,7 @@ impl ResearchOrchestrator {
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
         let mut summarizer_client = OllamaClient::with_config(base_url, self.research_model.clone());
+        summarizer_client.set_max_tool_turns(self.max_tool_turns);
 
         let prompt = format!(
             "Condense these research findings while preserving all key information:\n\n\
@@ -577,6 +594,7 @@ impl ResearchOrchestrator {
             };
 
             let mut advocate_client = OllamaClient::with_config(base_url.clone(), self.research_model.clone());
+            advocate_client.set_max_tool_turns(self.max_tool_turns);
             if let Some(executor) = &self.tool_executor {
                 advocate_client.set_tool_executor(executor.clone());
             }
@@ -612,6 +630,7 @@ impl ResearchOrchestrator {
             };
 
             let mut skeptic_client = OllamaClient::with_config(base_url.clone(), self.research_model.clone());
+            skeptic_client.set_max_tool_turns(self.max_tool_turns);
             if let Some(executor) = &self.tool_executor {
                 skeptic_client.set_tool_executor(executor.clone());
             }
@@ -635,6 +654,7 @@ impl ResearchOrchestrator {
         );
 
         let mut synthesizer_client = OllamaClient::with_config(base_url, self.research_model.clone());
+        synthesizer_client.set_max_tool_turns(self.max_tool_turns);
         if let Some(executor) = &self.tool_executor {
             synthesizer_client.set_tool_executor(executor.clone());
         }
@@ -721,6 +741,7 @@ impl ResearchOrchestrator {
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
         let mut writer_client = OllamaClient::with_config(base_url, self.research_model.clone());
+        writer_client.set_max_tool_turns(self.max_tool_turns);
         let document = writer_client.query_streaming(&prompt, |_| {}).await?;
 
         Ok(document)
@@ -743,6 +764,7 @@ impl ResearchOrchestrator {
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
         let mut critic_client = OllamaClient::with_config(base_url, self.research_model.clone());
+        critic_client.set_max_tool_turns(self.max_tool_turns);
         let review = critic_client.query_streaming(&prompt, |_| {}).await?;
 
         Ok(review)
@@ -764,6 +786,7 @@ impl ResearchOrchestrator {
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
         let mut refiner_client = OllamaClient::with_config(base_url, self.research_model.clone());
+        refiner_client.set_max_tool_turns(self.max_tool_turns);
 
         // Refiner can use tools
         if let Some(executor) = &self.tool_executor {
