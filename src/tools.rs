@@ -35,6 +35,8 @@ pub struct ToolsConfig {
 pub struct Tools {
     pub http: Vec<HttpTool>,
     pub mcp: Vec<McpServer>,
+    #[serde(default)]
+    pub builtin: Vec<String>, // List of built-in tools to enable
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -141,14 +143,30 @@ pub struct McpTool {
 
 impl ToolExecutor {
     pub fn new(config: ToolsConfig, api_keys: HashMap<String, String>) -> Self {
-        ToolExecutor {
+        let mut executor = ToolExecutor {
             config,
             http_client: reqwest::Client::new(),
             mcp_connections: TokioMutex::new(HashMap::new()),
             mcp_tools: StdMutex::new(HashMap::new()),
             api_keys,
             tool_usage: StdMutex::new(HashMap::new()),
+        };
+
+        // Register built-in tools
+        executor.register_builtin_tools();
+
+        executor
+    }
+
+    fn register_builtin_tools(&mut self) {
+        // Check which built-in tools are enabled
+        for tool_name in &self.config.tools.builtin {
+            debug_println!("[BuiltIn] Registering built-in tool: {}", tool_name);
         }
+    }
+
+    pub fn is_builtin_tool(&self, tool_name: &str) -> bool {
+        self.config.tools.builtin.contains(&tool_name.to_string())
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<Self, anyhow::Error> {
@@ -728,8 +746,70 @@ impl ToolExecutor {
         }
     }
 
+    pub async fn execute_builtin_tool(&self, tool_name: &str, params: HashMap<String, String>)
+        -> Result<Value, anyhow::Error> {
+
+        match tool_name {
+            "pdf_extract" => self.builtin_pdf_extract(params).await,
+            _ => Err(anyhow::anyhow!("Unknown built-in tool: {}", tool_name)),
+        }
+    }
+
+    async fn builtin_pdf_extract(&self, params: HashMap<String, String>) -> Result<Value, anyhow::Error> {
+        let url = params.get("url")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter for pdf_extract"))?;
+
+        debug_println!("[BuiltIn:PDF] Fetching PDF from: {}", url);
+
+        // Download PDF
+        let response = self.http_client.get(url).send().await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!("Failed to download PDF: HTTP {}", response.status()));
+        }
+
+        let pdf_bytes = response.bytes().await?;
+
+        // Extract text from PDF
+        let text = tokio::task::spawn_blocking(move || {
+            pdf_extract::extract_text_from_mem(&pdf_bytes)
+        }).await??;
+
+        debug_println!("[BuiltIn:PDF] Extracted {} characters of text", text.len());
+
+        Ok(json!({
+            "text": text,
+            "length": text.len(),
+            "source": url
+        }))
+    }
+
+
     pub fn get_tool_descriptions(&self) -> Vec<ToolDescription> {
         let mut descriptions = Vec::new();
+
+        // Built-in tools
+        for tool_name in &self.config.tools.builtin {
+            let (description, parameters) = match tool_name.as_str() {
+                "pdf_extract" => (
+                    "Extracts text content from a PDF file at a given URL. Returns the full text content of the PDF document.".to_string(),
+                    vec![ParameterDescription {
+                        name: "url".to_string(),
+                        param_type: "string".to_string(),
+                        description: "URL of the PDF file to extract text from. Must be a valid HTTP/HTTPS URL pointing to a PDF document.".to_string(),
+                        required: true,
+                    }]
+                ),
+                _ => continue,
+            };
+
+            descriptions.push(ToolDescription {
+                name: tool_name.clone(),
+                tool_type: "builtin".to_string(),
+                description,
+                parameters,
+            });
+        }
 
         // HTTP tools
         for tool in &self.config.tools.http {
@@ -791,6 +871,7 @@ pub fn load_tools_config(path: &str) -> Result<ToolsConfig, anyhow::Error> {
         debug_println!("[TOOLS] Configuration file is empty");
         return Ok(ToolsConfig {
             tools: Tools {
+                builtin: Vec::new(),
                 http: Vec::new(),
                 mcp: Vec::new(),
             }

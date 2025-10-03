@@ -126,6 +126,7 @@ pub struct OllamaClient {
     model: String,
     client: reqwest::Client,
     tool_executor: Option<Arc<Mutex<ToolExecutor>>>,
+    available_tools: Option<Vec<String>>, // Filter to only these tools if specified
 }
 
 impl OllamaClient {
@@ -138,7 +139,7 @@ impl OllamaClient {
             .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        OllamaClient { base_url, model, client, tool_executor: None }
+        OllamaClient { base_url, model, client, tool_executor: None, available_tools: None }
     }
 
     pub fn with_config(base_url: String, model: String) -> Self {
@@ -146,11 +147,15 @@ impl OllamaClient {
             .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        OllamaClient { base_url, model, client, tool_executor: None }
+        OllamaClient { base_url, model, client, tool_executor: None, available_tools: None }
     }
 
     pub fn set_tool_executor(&mut self, executor: Arc<Mutex<ToolExecutor>>) {
         self.tool_executor = Some(executor);
+    }
+
+    pub fn set_available_tools(&mut self, tools: Vec<String>) {
+        self.available_tools = Some(tools);
     }
 
     pub fn get_model(&self) -> &str {
@@ -214,7 +219,13 @@ impl OllamaClient {
             // Build prompt with tool descriptions if available and allowed
             let enhanced_prompt = if allow_tools && self.tool_executor.is_some() {
             let executor = self.tool_executor.as_ref().unwrap().lock().await;
-            let tools = executor.get_tool_descriptions();
+            let mut tools = executor.get_tool_descriptions();
+
+            // Filter tools if available_tools is specified
+            if let Some(ref allowed) = self.available_tools {
+                tools.retain(|tool| allowed.contains(&tool.name));
+            }
+
             if !tools.is_empty() {
                 let tools_json = serde_json::to_string_pretty(&tools)?;
 
@@ -589,6 +600,53 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
             .ok_or_else(|| anyhow::anyhow!("Missing parameters"))?;
 
         let raw_result = match tool_type {
+            "builtin" => {
+                // Convert JSON parameters to HashMap<String, String>
+                let params: std::collections::HashMap<String, String> = if let Some(obj) = parameters.as_object() {
+                    obj.iter()
+                        .map(|(k, v)| {
+                            let value = match v {
+                                Value::String(s) => s.clone(),
+                                Value::Number(n) => n.to_string(),
+                                Value::Bool(b) => b.to_string(),
+                                _ => v.to_string(),
+                            };
+                            (k.clone(), value)
+                        })
+                        .collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+                let executor = executor.lock().await;
+
+                // Format parameters for display
+                let params_summary: Vec<String> = params.iter()
+                    .map(|(k, v)| format!("- **{}**: {}", k, v))
+                    .collect();
+                let params_str = if params_summary.is_empty() {
+                    "No parameters".to_string()
+                } else {
+                    params_summary.join("\n")
+                };
+
+                match executor.execute_builtin_tool(tool_name, params.clone()).await {
+                    Ok(result) => {
+                        let result_str = serde_json::to_string_pretty(&result)?;
+
+                        // Summarize if too long
+                        let summarized_result = self.summarize_tool_result(tool_name, &result_str).await?;
+
+                        format!(
+                            "Built-in tool '{}' was called with:\n{}\n\nAnd returned:\n{}",
+                            tool_name, params_str, summarized_result
+                        )
+                    },
+                    Err(e) => {
+                        format!("Built-in tool '{}' failed with error: {}", tool_name, e)
+                    }
+                }
+            },
             "http" => {
                 // Convert JSON parameters to HashMap<String, String>
                 let params: std::collections::HashMap<String, String> = if let Some(obj) = parameters.as_object() {
@@ -673,7 +731,10 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
                     }
                 }
             },
-            _ => return Err(anyhow::anyhow!("Unknown tool type: {}", tool_type))
+            _ => {
+                format!("Tool '{}' of type '{}' is not available. Please continue without this tool.",
+                    tool_name, tool_type)
+            }
         };
 
         Ok(raw_result)
@@ -695,6 +756,31 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
             .ok_or_else(|| anyhow::anyhow!("Missing parameters"))?;
 
         match tool_type {
+            "builtin" => {
+                // Convert JSON parameters to HashMap<String, String>
+                let params: std::collections::HashMap<String, String> = if let Some(obj) = parameters.as_object() {
+                    obj.iter()
+                        .map(|(k, v)| {
+                            let value = match v {
+                                Value::String(s) => s.clone(),
+                                Value::Number(n) => n.to_string(),
+                                Value::Bool(b) => b.to_string(),
+                                _ => v.to_string(),
+                            };
+                            (k.clone(), value)
+                        })
+                        .collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+                let executor = executor.lock().await;
+
+                match executor.execute_builtin_tool(tool_name, params).await {
+                    Ok(result) => Ok(serde_json::to_string(&result)?),
+                    Err(e) => Err(e),
+                }
+            },
             "http" => {
                 // Convert JSON parameters to HashMap<String, String>
                 let params: std::collections::HashMap<String, String> = if let Some(obj) = parameters.as_object() {
@@ -782,7 +868,11 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
                     }
                 }
             },
-            _ => Err(anyhow::anyhow!("Unknown tool type: {}", tool_type))?
+            _ => {
+                // Unknown tool type - return message and continue instead of failing
+                Ok(format!("Tool '{}' of type '{}' is not available. Please continue without this tool.",
+                    tool_name, tool_type))
+            }
         }
     }
 

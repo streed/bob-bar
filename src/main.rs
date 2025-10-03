@@ -651,7 +651,7 @@ impl App {
         // Create Ollama client
         let mut ollama_client = ollama::OllamaClient::with_config(
             config.ollama.host,
-            config.ollama.model,
+            config.ollama.model.clone(),
         );
 
         let tool_executor_clone = if let Some(ref executor) = tool_executor {
@@ -669,11 +669,15 @@ impl App {
 
         // Initialize research orchestrator
         let agents_path = config::Config::get_config_dir().join("agents.json");
+        let research_model = config.ollama.research_model.clone()
+            .unwrap_or_else(|| config.ollama.model.clone());
+
         let research_orchestrator = if agents_path.exists() {
             match research::ResearchOrchestrator::from_file(
                 &agents_path,
                 ollama_client_arc.clone(),
-                config.ollama.context_window
+                config.ollama.context_window,
+                research_model.clone()
             ) {
                 Ok(mut orchestrator) => {
                     // Override with config.toml settings
@@ -685,8 +689,10 @@ impl App {
                     if DEBUG_MODE.load(Ordering::Relaxed) {
                         eprintln!("=== Research Mode ===");
                         eprintln!("Research orchestrator initialized from: {}", agents_path.display());
+                        eprintln!("Research model: {}", research_model);
                         eprintln!("Context window: {} tokens", config.ollama.context_window);
                         eprintln!("Max refinement iterations: {}", config.research.max_refinement_iterations);
+                        eprintln!("Max debate rounds: {}", config.research.max_debate_rounds);
                         eprintln!("Worker count: {}", config.research.worker_count);
                         eprintln!("=====================\n");
                     }
@@ -766,21 +772,21 @@ impl App {
 
                     // Create progress channel
                     use tokio::sync::mpsc;
-                    let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+                    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
 
-                    // Set up the progress channel in the orchestrator
-                    {
-                        let orch_clone = orchestrator.clone();
-                        tokio::task::spawn(async move {
-                            let mut orch = orch_clone.lock().await;
-                            orch.set_progress_channel(progress_tx);
-                        });
-                    }
+                    // Spawn a task to listen for progress updates
+                    tokio::spawn(async move {
+                        while let Some(progress) = progress_rx.recv().await {
+                            // Progress updates will show in debug output via eprintln in research.rs
+                            let _ = progress; // Acknowledge we received it
+                        }
+                    });
 
-                    // Just run the research task - progress will update via Tick
+                    // Run the research task with progress channel
                     Task::perform(
                         async move {
                             let mut orch = orchestrator.lock().await;
+                            orch.set_progress_channel(progress_tx);
                             orch.research(&query).await
                         },
                         |result| match result {
@@ -897,6 +903,7 @@ impl App {
                     ResearchProgress::WorkerCompleted(name) => format!("✓ {} completed", name),
                     ResearchProgress::Combining => "Combining research results...".to_string(),
                     ResearchProgress::CriticReviewing => "Critic reviewing output...".to_string(),
+                    ResearchProgress::DebateRound(current, max) => format!("Debate round {}/{} in progress...", current, max),
                     ResearchProgress::Refining(current, max) => format!("Refining output (iteration {}/{})", current, max),
                     ResearchProgress::AddingBibliography => "Generating bibliography...".to_string(),
                     ResearchProgress::WritingDocument(current, max) => format!("Writing document (iteration {}/{})", current, max),
@@ -1196,6 +1203,21 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                 )
                 .direction(Direction::Vertical(Scrollbar::default()))
                 .height(Length::Fill)
+                .into()
+            } else if self.response_text.is_empty() {
+                // Show centered welcome message when empty
+                container(
+                    column![
+                        text("Ready").size(24),
+                        text("Enter a query above to begin").size(14)
+                    ]
+                    .spacing(10)
+                    .align_x(alignment::Horizontal::Center)
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(alignment::Horizontal::Center)
+                .align_y(alignment::Vertical::Center)
                 .into()
             } else {
                 scrollable(

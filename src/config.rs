@@ -22,6 +22,10 @@ fn default_worker_count() -> usize {
     3
 }
 
+fn default_max_debate_rounds() -> usize {
+    2
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     pub ollama: OllamaConfig,
@@ -33,12 +37,18 @@ fn default_vision_model() -> String {
     "llama3.2-vision:11b".to_string()
 }
 
+fn default_research_model() -> Option<String> {
+    None // Will use main model if not specified
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct OllamaConfig {
     pub host: String,
     pub model: String,
     #[serde(default = "default_vision_model")]
     pub vision_model: String,
+    #[serde(default = "default_research_model")]
+    pub research_model: Option<String>,
     #[serde(default = "default_context_window")]
     pub context_window: usize,
     #[serde(default = "default_max_tool_turns")]
@@ -53,6 +63,8 @@ pub struct ResearchConfig {
     pub max_document_iterations: usize,
     #[serde(default = "default_worker_count")]
     pub worker_count: usize,
+    #[serde(default = "default_max_debate_rounds")]
+    pub max_debate_rounds: usize,
 }
 
 impl Default for ResearchConfig {
@@ -61,6 +73,7 @@ impl Default for ResearchConfig {
             max_refinement_iterations: 5,
             max_document_iterations: 3,
             worker_count: 3,
+            max_debate_rounds: 2,
         }
     }
 }
@@ -72,6 +85,7 @@ impl Default for Config {
                 host: "http://localhost:11434".to_string(),
                 model: "llama2".to_string(),
                 vision_model: "llama3.2-vision:11b".to_string(),
+                research_model: None,
                 context_window: 128000,
                 max_tool_turns: 5,
             },

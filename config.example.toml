@@ -15,6 +15,22 @@ model = "llama2"
 # Default: llama3.2-vision:11b
 vision_model = "llama3.2-vision:11b"
 
+# Model to use specifically for research mode
+# If not set, uses the main model above
+# Research mode benefits from larger, more capable models
+# Default: uses main model
+# research_model = "llama2:70b"
+
+# Context window size (in tokens) for the model
+# This determines how much information can be processed at once
+# Common values:
+#   - 4096: llama2, mistral (default)
+#   - 8192: codellama, larger models
+#   - 32768: llama2:70b, some fine-tuned models
+#   - 128000: gpt-4, claude-style models
+# Default: 128000
+context_window = 128000
+
 # Maximum number of tool iterations per query
 # This prevents infinite loops when chaining tools
 # Default: 5
@@ -28,7 +44,20 @@ max_tool_turns = 5
 # Default: 5
 max_refinement_iterations = 5
 
+# Maximum iterations for document writing and review
+# The document writer creates a professional document from research findings
+# Document critic reviews for completeness, clarity, and quality
+# Loop stops when document critic approves OR max iterations reached
+# Default: 3
+max_document_iterations = 3
+
 # Number of worker agents to spawn for parallel research
 # Workers research different sub-questions concurrently
 # Default: 3
 worker_count = 3
+
+# Maximum number of back-and-forth debate rounds
+# Each round: advocate rebuts → skeptic responds
+# After all rounds, synthesizer makes final decision
+# Default: 2
+max_debate_rounds = 2
