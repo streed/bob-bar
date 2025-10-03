@@ -10,6 +10,7 @@ A fast, elegant AI launcher built with Rust and Iced. bob-bar provides instant a
 - **⚡ Lightning Fast** - Native Rust performance with minimal resource usage
 - **🎯 Launcher-Style Interface** - Always-on-top, centered window that appears instantly
 - **🤖 Local AI Integration** - Connects to Ollama for private, local AI inference
+- **🔬 Research Mode** - Multi-agent system for publication-quality research with citations and fact-checking
 - **🔧 Tool Support** - Extensible tool system with HTTP and MCP protocol support
 - **📋 Copy Output** - One-click copy to clipboard
 - **📸 Screenshot Analysis** - Capture and analyze screenshots with vision models
@@ -84,7 +85,15 @@ bob-bar uses configuration files located in `~/.config/bob-bar/`:
 host = "http://localhost:11434"
 model = "llama2"                      # Model for text queries
 vision_model = "llama3.2-vision:11b"  # Model for screenshot analysis
+research_model = "llama2:70b"         # Model for research mode (optional)
+context_window = 128000               # Context window size (tokens)
 max_tool_turns = 5
+
+[research]
+max_refinement_iterations = 5         # Debate/refine loop iterations
+max_document_iterations = 3           # Document writing iterations
+max_debate_rounds = 2                 # Multi-round debate rounds
+worker_count = 3                      # Parallel research workers
 
 [window]
 width = 1200
@@ -186,6 +195,40 @@ ollama pull llama3.2-vision:11b
 6. **Browse history** - Use the left sidebar to load previous queries/answers
 7. **Close quickly** - Press ESC to dismiss the window
 
+### Research Mode
+
+bob-bar includes a sophisticated multi-agent research system for producing publication-quality, well-sourced documents:
+
+**Enable Research Mode:**
+Click the `[Research: OFF]` button to toggle to `[Research: ON]`
+
+**Example Query:**
+```
+Compare Python and Rust performance characteristics,
+including benchmark data and real-world use cases.
+```
+
+**What Happens:**
+1. **Query Decomposition** - Lead agent breaks query into 5-8 verifiable sub-questions
+2. **Parallel Research** - Specialized workers research concurrently using web_search
+3. **Multi-Round Debate** - Advocate and skeptic agents verify quality with fact-checking
+4. **Iterative Refinement** - Refiner addresses gaps identified in debate
+5. **Document Writing** - Professional document created with inline citations
+6. **References Section** - Clickable URLs automatically extracted and listed
+
+**Output Features:**
+- Every claim cited with source URLs: `[Source: https://example.com]`
+- Structured markdown with Executive Summary, Main Content, and References
+- Independent verifiability - all claims traceable to sources
+- Publication-ready quality standards
+
+**Configuration:**
+- Set dedicated research model in config: `research_model = "llama2:70b"`
+- Customize agents in `~/.config/bob-bar/agents.json`
+- Tune debate rounds, worker count, and iterations
+
+See [RESEARCH_MODE.md](RESEARCH_MODE.md) for complete documentation.
+
 ### Screenshot Analysis
 
 The `--screenshot` flag captures your current screen and analyzes it with a vision model:
@@ -231,16 +274,21 @@ bob-bar is built with:
 bob-bar/
 ├── src/
 │   ├── main.rs      # UI and application logic
-│   ├── ollama.rs    # Ollama API client
-│   ├── tools.rs     # Tool execution system
-│   └── config.rs    # Configuration management
-│   └── history.rs   # SQLite-backed query/response history
+│   ├── ollama.rs    # Ollama API client and tool integration
+│   ├── tools.rs     # Tool execution system (HTTP, MCP, built-in)
+│   ├── config.rs    # Configuration management
+│   ├── history.rs   # SQLite-backed query/response history
+│   └── research.rs  # Multi-agent research orchestration
 ├── config.example.toml      # Example configuration
+├── agents.example.json      # Example research agent configuration
 ├── api_keys.example.toml    # Example API keys
-└── tools.example.json       # Example tool definitions
+├── tools.example.json       # Example tool definitions
+├── README.md                # This file
+└── RESEARCH_MODE.md         # Research mode documentation
 
 ~/.config/bob-bar/           # User configuration directory
 ├── config.toml              # Main configuration
+├── agents.json              # Research agent configuration (optional)
 ├── api_keys.toml            # API keys (not in repo)
 ├── tools.json               # Tool definitions (optional)
 └── history.sqlite           # Local history database (auto-created)
