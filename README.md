@@ -34,17 +34,24 @@ A fast, elegant AI launcher built with Rust and Iced. bob-bar provides instant a
 curl -fsSL https://raw.githubusercontent.com/streed/bob-bar/main/install.sh | bash
 ```
 
+**Quick Install (Windows, builds from source)**
+
+```powershell
+irm https://raw.githubusercontent.com/streed/bob-bar/main/install.ps1 | iex
+```
+
 Requirements:
 - `git` and Rust (`cargo`) installed. Install Rust from https://rustup.rs
 
 The install script will:
 - Clone the repository and build a native binary for your machine
-- Install bob-bar to `~/.local/bin/bob-bar`
-- Create default configuration files in `~/.config/bob-bar/`
+- Install bob-bar to `~/.local/bin/bob-bar` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows)
+- Create default configuration files in `~/.config/bob-bar/` (Linux/macOS) or `%APPDATA%\bob-bar` (Windows)
 - On macOS: create a double‑clickable app at `~/Applications/Bob Bar.app`
 - On Linux: create a launcher at `~/.local/share/applications/bob-bar.desktop`
+- On Windows: automatically add installation directory to PATH
 
-Icon behavior
+Icon behavior (Linux/macOS)
 - Default branded icon: included at `packaging/icons/bob-bar.svg`. The installer converts it to PNG when `rsvg-convert`, `inkscape`, or ImageMagick `convert` is available.
 - Custom icon: provide `BOB_BAR_ICON=/path/to/icon.png` when running the installer to override the default.
 - macOS: if `sips` and `iconutil` are available, the installer generates an `.icns` and embeds it in the app bundle.
@@ -55,6 +62,7 @@ Icon behavior
 
 If you prefer to build from source:
 
+Linux/macOS:
 ```bash
 # Prerequisites: Rust 1.70 or higher
 # Install from: https://rustup.rs
@@ -74,9 +82,32 @@ cp api_keys.example.toml ~/.config/bob-bar/api_keys.toml
 cp tools.example.json ~/.config/bob-bar/tools.json
 ```
 
+Windows (PowerShell):
+```powershell
+# Prerequisites: Rust 1.70 or higher
+# Install from: https://rustup.rs
+
+# Clone the repository
+git clone https://github.com/streed/bob-bar.git
+cd bob-bar
+
+# Build and install
+cargo build --release
+mkdir -Force "$env:USERPROFILE\.local\bin"
+copy target\release\bob-bar.exe "$env:USERPROFILE\.local\bin\"
+
+# Setup configuration
+mkdir -Force "$env:APPDATA\bob-bar"
+copy config.example.toml "$env:APPDATA\bob-bar\config.toml"
+copy api_keys.example.toml "$env:APPDATA\bob-bar\api_keys.toml"
+copy tools.example.json "$env:APPDATA\bob-bar\tools.json"
+```
+
 ## Configuration
 
-bob-bar uses configuration files located in `~/.config/bob-bar/`:
+bob-bar uses configuration files located in:
+- Linux/macOS: `~/.config/bob-bar/`
+- Windows: `%APPDATA%\bob-bar`
 
 ### `~/.config/bob-bar/config.toml`
 
