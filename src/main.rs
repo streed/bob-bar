@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod config;
+mod progress;
 mod history;
 mod ollama;
 mod tools;
@@ -17,6 +18,7 @@ use iced::{
     window::{self, Level, settings::PlatformSpecific},
     Color,
 };
+use iced::widget::text as text_widget;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -25,12 +27,39 @@ use notify_rust::Notification;
 use iced::widget::scrollable::{Direction, Scrollbar};
 use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
+use once_cell::sync::Lazy;
+use std::sync::Mutex as StdMutex;
 
 static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
 const ENABLE_NOTIFICATIONS: bool = false;
 const TABLE_MAX_COL_WIDTH: usize = 80; // clamp overly wide columns to reduce horizontal scrolling
 const INPUT_HEIGHT: f32 = 48.0; // approximate height to align sidebar header with input
 const TABLE_PLAIN_TEXT_RULES: &str = "When including Markdown tables in your response: 1) do not apply any styling (no bold, italics, code formatting) to table headers or table cell values; 2) do not use Unicode symbols or emoji inside any table cells — use plain ASCII text only (letters, numbers, basic punctuation).";
+
+// Global research progress store updated from background task, polled by Tick
+static RESEARCH_PROGRESS_GLOBAL: Lazy<StdMutex<Option<String>>> = Lazy::new(|| StdMutex::new(None));
+
+fn extract_hostname(url: &str) -> String {
+    // Trim leading/trailing whitespace
+    let u = url.trim();
+    // Strip scheme
+    let without_scheme = if let Some(pos) = u.find("://") {
+        &u[pos + 3..]
+    } else {
+        u
+    };
+    // Take up to first path/query/fragment separator
+    let host = without_scheme
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or(without_scheme);
+    // Remove credentials if present and port
+    let host = if let Some(at) = host.rfind('@') { &host[at + 1..] } else { host };
+    let host = host.split(':').next().unwrap_or(host);
+    // Remove common www. prefix for brevity
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    host.to_string()
+}
 
 fn render_markdown(markdown: String) -> Element<'static, Message> {
     let mut md_options = Options::empty();
@@ -552,6 +581,7 @@ fn run_screenshot_mode(_config: config::Config) -> iced::Result {
 enum Message {
     InputChanged(String),
     Submit,
+    NewQuery,
     ResponseReceived(String),
     Error(String),
     Tick,
@@ -768,6 +798,9 @@ impl App {
                 if self.research_mode && self.research_orchestrator.is_some() {
                     self.research_start_time = Some(std::time::Instant::now());
                     self.research_progress = Some("Starting research...".to_string());
+                    if let Ok(mut g) = RESEARCH_PROGRESS_GLOBAL.lock() {
+                        *g = Some("Starting research...".to_string());
+                    }
 
                     let query = self.input_text.clone();
                     let orchestrator = self.research_orchestrator.clone().unwrap();
@@ -785,6 +818,8 @@ impl App {
                                 ResearchProgress::Started => "Starting research...".to_string(),
                                 ResearchProgress::Decomposing => "Decomposing query into sub-questions...".to_string(),
                                 ResearchProgress::WorkersStarted(n) => format!("Dispatching {} research workers...", n),
+                                ResearchProgress::WorkerStarted { worker, question } => format!("{}: researching — {}", worker, question),
+                                ResearchProgress::WorkerStatus { worker, status } => format!("{}: {}", worker, status),
                                 ResearchProgress::WorkerCompleted(name) => format!("✓ {} completed", name),
                                 ResearchProgress::Combining => "Combining research results...".to_string(),
                                 ResearchProgress::CriticReviewing => "Critic reviewing output...".to_string(),
@@ -795,7 +830,9 @@ impl App {
                                 ResearchProgress::DocumentReviewing => "Document critic reviewing...".to_string(),
                                 ResearchProgress::Completed => "Research complete!".to_string(),
                             };
-                            eprintln!("[Research Progress] {}", msg);
+                            if let Ok(mut g) = RESEARCH_PROGRESS_GLOBAL.lock() {
+                                *g = Some(msg);
+                            }
                         }
                     });
 
@@ -834,13 +871,29 @@ impl App {
                     )
                 }
             }
+            Message::NewQuery => {
+                if self.is_loading || self.research_progress.is_some() { return Task::none(); }
+                self.input_text.clear();
+                self.response_text.clear();
+                self.streaming_text.clear();
+                self.screenshot_path = None;
+                self.selected_history = None;
+                self.output_editor = text_editor::Content::with_text("");
+                self.research_progress = None;
+                crate::tools::clear_current_sources();
+                crate::progress::clear();
+                Task::none()
+            }
             Message::ResponseReceived(response) => {
                 self.response_text = response;
                 self.streaming_text = String::new();
                 self.is_loading = false;
                 self.research_progress = None;
                 self.research_start_time = None;
-
+                if let Ok(mut g) = RESEARCH_PROGRESS_GLOBAL.lock() { *g = None; }
+                crate::tools::clear_current_sources();
+                crate::progress::clear();
+                
                 if ENABLE_NOTIFICATIONS {
                     std::thread::spawn(|| {
                         // On Linux, set urgency and timeout; other OSes may not support these
@@ -875,11 +928,20 @@ impl App {
                 self.response_text = error;
                 self.streaming_text = String::new();
                 self.is_loading = false;
+                if let Ok(mut g) = RESEARCH_PROGRESS_GLOBAL.lock() { *g = None; }
+                crate::tools::clear_current_sources();
+                crate::progress::clear();
                 Task::none()
             }
             Message::Tick => {
                 if self.is_loading {
                     self.loading_frame = (self.loading_frame + 1) % 80; // 10 frames * 8 messages
+                    // Pull latest research progress from global store
+                    if let Ok(g) = RESEARCH_PROGRESS_GLOBAL.lock() {
+                        if let Some(ref s) = *g {
+                            self.research_progress = Some(s.clone());
+                        }
+                    }
                 }
                 Task::none()
             }
@@ -917,6 +979,8 @@ impl App {
                     ResearchProgress::Started => "Starting research...".to_string(),
                     ResearchProgress::Decomposing => "Decomposing query into sub-questions...".to_string(),
                     ResearchProgress::WorkersStarted(n) => format!("Dispatching {} research workers...", n),
+                    ResearchProgress::WorkerStarted { worker, question } => format!("{}: researching — {}", worker, question),
+                    ResearchProgress::WorkerStatus { worker, status } => format!("{}: {}", worker, status),
                     ResearchProgress::WorkerCompleted(name) => format!("✓ {} completed", name),
                     ResearchProgress::Combining => "Combining research results...".to_string(),
                     ResearchProgress::CriticReviewing => "Critic reviewing output...".to_string(),
@@ -1034,7 +1098,7 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let timer = if self.is_loading {
+        let timer = if self.is_loading || self.research_progress.is_some() {
             time::every(Duration::from_millis(200)).map(|_| Message::Tick)
         } else {
             Subscription::none()
@@ -1050,6 +1114,8 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                     // Use `logo()` to represent Command on macOS
                     if (c == "f" || c == "F") && modifiers.control() && modifiers.logo() {
                         Some(Message::ToggleFullscreen)
+                    } else if (c == "n" || c == "N") && (modifiers.logo() || modifiers.control()) {
+                        Some(Message::NewQuery)
                     } else {
                         None
                     }
@@ -1110,14 +1176,55 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
             None
         };
 
-        // Create input row with toggle
-        let input_row = if let Some(toggle) = research_toggle {
-            row![input, toggle]
-                .spacing(8)
-                .width(Length::Fill)
+        // Mouse-friendly Enter + New buttons (center text vertically)
+        let enter_label = container(text("Enter").size(16))
+            .align_x(alignment::Horizontal::Center)
+            .align_y(alignment::Vertical::Center)
+            .height(Length::Fill);
+        let new_label = container(text("New").size(16))
+            .align_x(alignment::Horizontal::Center)
+            .align_y(alignment::Vertical::Center)
+            .height(Length::Fill);
+
+        let enter_btn = if self.is_loading || self.input_text.trim().is_empty() {
+            button(enter_label)
+                .padding([8, 12])
+                .height(Length::Fixed(INPUT_HEIGHT))
         } else {
-            row![input]
-                .width(Length::Fill)
+            button(enter_label)
+                .on_press(Message::Submit)
+                .padding([8, 12])
+                .height(Length::Fixed(INPUT_HEIGHT))
+        };
+        let new_btn = if self.is_loading {
+            button(new_label)
+                .padding([8, 12])
+                .height(Length::Fixed(INPUT_HEIGHT))
+        } else {
+            button(new_label)
+                .on_press(Message::NewQuery)
+                .padding([8, 12])
+                .height(Length::Fixed(INPUT_HEIGHT))
+        };
+
+        // Create input row with optional research toggle and action buttons
+        let input_row = if let Some(toggle) = research_toggle {
+            row![
+                container(input).width(Length::Fill),
+                enter_btn,
+                new_btn,
+                toggle
+            ]
+            .spacing(8)
+            .width(Length::Fill)
+        } else {
+            row![
+                container(input).width(Length::Fill),
+                enter_btn,
+                new_btn
+            ]
+            .spacing(8)
+            .width(Length::Fill)
         };
 
         let output: Element<Message> = if self.is_loading {
@@ -1140,13 +1247,53 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                     "0s".to_string()
                 };
 
+                // Fetch current sources list
+                let sources = crate::tools::get_current_sources();
+                let sources_view: Element<Message> = if sources.is_empty() {
+                    text("").into()
+                } else {
+                    let mut col = column![text("Sources in progress:").size(14)];
+                    for s in sources.iter().take(10) {
+                        let host = extract_hostname(s);
+                        col = col.push(text(host).size(13));
+                    }
+                    col.spacing(4).into()
+                };
+
+                // Recent activity lines (verbose progress)
+                let recent = crate::progress::recent(8);
+                let recent_view: Element<Message> = if recent.is_empty() {
+                    text("").into()
+                } else {
+                    let mut col = column![text("Recent activity:").size(14)];
+                    for entry in recent {
+                        let color = match entry.kind {
+                            crate::progress::Kind::Info => Color::from_rgb(0.75, 0.78, 0.90),
+                            crate::progress::Kind::Http => Color::from_rgb(0.65, 0.70, 0.80),
+                            crate::progress::Kind::Debate => Color::from_rgb(0.95, 0.70, 0.40),
+                            crate::progress::Kind::Refiner => Color::from_rgb(0.45, 0.75, 1.0),
+                            crate::progress::Kind::Writer => Color::from_rgb(0.55, 0.90, 0.55),
+                            crate::progress::Kind::DocumentCritic => Color::from_rgb(0.90, 0.55, 0.85),
+                            crate::progress::Kind::Combiner => Color::from_rgb(0.40, 0.85, 0.85),
+                            crate::progress::Kind::Worker => Color::from_rgb(0.55, 0.85, 1.0),
+                        };
+                        let line = text(entry.text)
+                            .size(13)
+                            .style(move |_theme: &Theme| text_widget::Style{ color: Some(color), ..Default::default() });
+                        col = col.push(line);
+                    }
+                    col.spacing(4).into()
+                };
+
                 container(
                     column![
                         text("🔬 Research Mode").size(24),
                         text(progress_text).size(18),
-                        text(format!("Elapsed: {}", elapsed)).size(14)
+                        text(format!("Elapsed: {}", elapsed)).size(14),
+                        sources_view,
+                        recent_view
                     ]
-                    .spacing(15)
+                    .spacing(12)
                     .align_x(alignment::Horizontal::Center)
                 )
                 .width(Length::Fill)

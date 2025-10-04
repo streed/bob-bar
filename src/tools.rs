@@ -7,6 +7,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use toml;
 use std::time::{Instant, Duration};
 use std::sync::Mutex as StdMutex;
+use once_cell::sync::Lazy;
+use std::collections::BTreeSet as StdBTreeSet;
 use tokio::sync::Mutex as TokioMutex;
 
 macro_rules! debug_println {
@@ -132,6 +134,37 @@ pub struct ToolExecutor {
     mcp_tools: StdMutex<HashMap<String, Vec<McpTool>>>,  // Store discovered MCP tools per server
     api_keys: HashMap<String, String>,
     tool_usage: StdMutex<HashMap<String, ToolUsage>>,  // Track usage per tool (with interior mutability)
+}
+
+// Track current HTTP sources for UI verbosity
+static CURRENT_SOURCES: Lazy<StdMutex<StdBTreeSet<String>>> = Lazy::new(|| StdMutex::new(StdBTreeSet::new()));
+
+pub fn note_current_source(url: &str) {
+    if let Ok(mut set) = CURRENT_SOURCES.lock() {
+        set.insert(url.to_string());
+    }
+}
+
+pub fn get_current_sources() -> Vec<String> {
+    if let Ok(set) = CURRENT_SOURCES.lock() {
+        return set.iter().cloned().collect();
+    }
+    Vec::new()
+}
+
+pub fn clear_current_sources() {
+    if let Ok(mut set) = CURRENT_SOURCES.lock() {
+        set.clear();
+    }
+}
+
+fn host_from_url(url: &str) -> String {
+    let u = url.trim();
+    let without_scheme = if let Some(pos) = u.find("://") { &u[pos + 3..] } else { u };
+    let host = without_scheme.split(|c| c == '/' || c == '?' || c == '#').next().unwrap_or(without_scheme);
+    let host = if let Some(at) = host.rfind('@') { &host[at + 1..] } else { host };
+    let host = host.split(':').next().unwrap_or(host);
+    host.strip_prefix("www.").unwrap_or(host).to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -590,6 +623,8 @@ impl ToolExecutor {
         }
 
         debug_println!("[HTTP] Final endpoint after path substitution: {}", final_endpoint);
+        // Record the resolved endpoint for UI verbosity
+        crate::tools::note_current_source(&final_endpoint);
 
         // Process headers with environment variable substitution
         let mut request_builder = match tool.method.as_str() {
@@ -634,7 +669,11 @@ impl ToolExecutor {
             request_builder = request_builder.header(header_name, processed_value);
         }
 
-        debug_println!("[HTTP] Making {} request to: {}", tool.method, tool.endpoint);
+        debug_println!("[HTTP] Making {} request to: {} (tool: {})", tool.method, tool.endpoint, tool_name);
+        crate::progress::log_with(
+            crate::progress::Kind::Http,
+            format!("HTTP {} {} [tool: {}]", tool.method, host_from_url(&final_endpoint), tool_name),
+        );
 
         // Add query parameters or JSON body based on method
         let response = match tool.method.as_str() {
@@ -668,6 +707,10 @@ impl ToolExecutor {
         };
 
         let status_code = response.status().as_u16();
+        crate::progress::log_with(
+            crate::progress::Kind::Http,
+            format!("HTTP {} {} → {} [tool: {}]", tool.method, host_from_url(&final_endpoint), status_code, tool_name),
+        );
         debug_println!("[HTTP] Response status: {}", status_code);
 
         // Check if status is in acceptable_status list (should be ignored)

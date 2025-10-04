@@ -484,6 +484,7 @@ dependencies = [
  "iced",
  "image",
  "notify-rust",
+ "once_cell",
  "pdf-extract",
  "pulldown-cmark",
  "regex",

@@ -12,6 +12,8 @@ pub enum ResearchProgress {
     Decomposing,
     WorkersStarted(usize), // number of workers
     WorkerCompleted(String), // worker name
+    WorkerStarted { worker: String, question: String },
+    WorkerStatus { worker: String, status: String },
     Combining,
     Refining(usize, usize), // current iteration, max iterations
     CriticReviewing,
@@ -127,8 +129,46 @@ impl ResearchOrchestrator {
 
     fn send_progress(&self, progress: ResearchProgress) {
         if let Some(tx) = &self.progress_tx {
-            let _ = tx.send(progress);
+            let _ = tx.send(progress.clone());
         }
+        // Also log a human-readable line for the UI verbose log
+        use crate::progress::{log_with, Kind};
+        let (line, kind) = match progress {
+            ResearchProgress::Started => ("Research started".to_string(), Kind::Info),
+            ResearchProgress::Decomposing => ("Decomposing query into sub-questions".to_string(), Kind::Info),
+            ResearchProgress::WorkersStarted(n) => (format!("Dispatching {} workers", n), Kind::Worker),
+            ResearchProgress::WorkerCompleted(name) => (format!("✓ Worker completed: {}", name), Kind::Worker),
+            ResearchProgress::WorkerStarted { worker, question } => (format!("→ {} researching: {}", worker, question), Kind::Worker),
+            ResearchProgress::WorkerStatus { worker, status } => {
+                let k = match worker.as_str() {
+                    "Debate" => Kind::Debate,
+                    "Refiner" => Kind::Refiner,
+                    "Writer" => Kind::Writer,
+                    "DocumentCritic" => Kind::DocumentCritic,
+                    "Combiner" => Kind::Combiner,
+                    _ => Kind::Worker,
+                };
+                (format!("{}: {}", worker, status), k)
+            },
+            ResearchProgress::Combining => ("Combining results".to_string(), Kind::Combiner),
+            ResearchProgress::Refining(i, max) => (format!("Refining output (iteration {}/{})", i, max), Kind::Refiner),
+            ResearchProgress::CriticReviewing => ("Critic reviewing output".to_string(), Kind::Debate),
+            ResearchProgress::DebateRound(i, max) => (format!("Debate round {}/{}", i, max), Kind::Debate),
+            ResearchProgress::AddingBibliography => ("Adding bibliography".to_string(), Kind::Writer),
+            ResearchProgress::WritingDocument(i, max) => (format!("Writing document (iteration {}/{})", i, max), Kind::Writer),
+            ResearchProgress::DocumentReviewing => ("Document critic reviewing".to_string(), Kind::DocumentCritic),
+            ResearchProgress::Completed => ("Research complete".to_string(), Kind::Info),
+        };
+        log_with(kind, line);
+    }
+
+    fn summarize_arg(text: &str, max: usize) -> String {
+        // Collapse whitespace and newlines to single spaces
+        let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.len() <= max { return collapsed; }
+        let mut s = collapsed.chars().take(max.saturating_sub(1)).collect::<String>();
+        s.push('…');
+        s
     }
 
     /// Main entry point for research mode
@@ -242,6 +282,11 @@ impl ResearchOrchestrator {
             let research_model = self.research_model.clone();
             let max_tool_turns = self.max_tool_turns;
 
+            // Emit start event for this worker
+            if let Some(p) = &progress_tx {
+                let _ = p.send(ResearchProgress::WorkerStarted { worker: worker.name.clone(), question: sub_q.question.clone() });
+            }
+
             let handle = tokio::spawn(async move {
                 let result = Self::execute_worker(
                     worker,
@@ -250,6 +295,7 @@ impl ResearchOrchestrator {
                     tool_executor,
                     research_model,
                     max_tool_turns,
+                    progress_tx.clone(),
                 ).await;
 
                 let worker_result = match result {
@@ -301,6 +347,7 @@ impl ResearchOrchestrator {
         tool_executor: Option<Arc<Mutex<ToolExecutor>>>,
         research_model: String,
         max_tool_turns: usize,
+        progress_tx: Option<mpsc::UnboundedSender<ResearchProgress>>,
     ) -> Result<String> {
         // Add small delay to avoid rate limiting
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -315,7 +362,17 @@ impl ResearchOrchestrator {
         if let Some(executor) = tool_executor {
             worker_client.set_tool_executor(executor);
         }
-        worker_client.set_available_tools(worker.available_tools.clone());
+        let available = worker.available_tools.clone();
+        worker_client.set_available_tools(available.clone());
+
+        // Emit a brief status about planned tool usage
+        if let Some(p) = &progress_tx {
+            if !available.is_empty() {
+                let _ = p.send(ResearchProgress::WorkerStatus { worker: worker.name.clone(), status: format!("Preparing tools: {}", available.join(", ")) });
+            } else {
+                let _ = p.send(ResearchProgress::WorkerStatus { worker: worker.name.clone(), status: "No external tools configured; using model only".to_string() });
+            }
+        }
 
         let prompt = format!(
             "CITATION REQUIREMENT: When citing sources, ALWAYS prefer full URLs when available. Use format [Source: https://full-url.com] instead of just site names. This enables independent verification.\n\n{}\n\nQuestion: {}",
@@ -323,7 +380,17 @@ impl ResearchOrchestrator {
             question
         );
 
+        // Emit a status before querying
+        if let Some(p) = &progress_tx {
+            let _ = p.send(ResearchProgress::WorkerStatus { worker: worker.name.clone(), status: "Querying sources and aggregating findings...".to_string() });
+        }
+
         let answer = worker_client.query_streaming(&prompt, |_| {}).await?;
+
+        // Emit a status after response
+        if let Some(p) = &progress_tx {
+            let _ = p.send(ResearchProgress::WorkerStatus { worker: worker.name.clone(), status: "Processing and structuring results...".to_string() });
+        }
         Ok(answer)
     }
 
@@ -384,6 +451,11 @@ impl ResearchOrchestrator {
 
     /// Combine worker results into a cohesive output
     async fn combine_results(&self, original_query: &str, results: &[WorkerResult]) -> Result<String> {
+        // Emit a status about combination stage for verbosity
+        self.send_progress(ResearchProgress::WorkerStatus {
+            worker: "Combiner".to_string(),
+            status: format!("Combining {} worker results", results.len()),
+        });
         let mut output = format!("# Research Results for: {}\n\n", original_query);
         let num_workers = results.len();
 
@@ -518,6 +590,10 @@ impl ResearchOrchestrator {
         for iteration in 0..max_iterations {
             // Multi-agent debate
             self.send_progress(ResearchProgress::CriticReviewing);
+            self.send_progress(ResearchProgress::WorkerStatus {
+                worker: "Debate".to_string(),
+                status: "Launching debate between Advocate, Skeptic, and Synthesizer".to_string(),
+            });
             let debate_result = self.conduct_debate(&current_output).await?;
 
             // Check if approved
@@ -529,6 +605,10 @@ impl ResearchOrchestrator {
             // Refine based on debate conclusions
             eprintln!("[Research] Iteration {}: Refining based on debate", iteration + 1);
             self.send_progress(ResearchProgress::Refining(iteration + 1, max_iterations));
+            self.send_progress(ResearchProgress::WorkerStatus {
+                worker: "Refiner".to_string(),
+                status: format!("Applying debate conclusions (iteration {}/{})", iteration + 1, max_iterations),
+            });
             current_output = self.refine_output(&current_output, &debate_result).await?;
 
             // If this was the last iteration, use the refined output anyway
@@ -543,6 +623,10 @@ impl ResearchOrchestrator {
     /// Conduct multi-agent debate to evaluate research output
     async fn conduct_debate(&self, output: &str) -> Result<String> {
         eprintln!("[Research] Starting multi-agent debate...");
+        self.send_progress(ResearchProgress::WorkerStatus {
+            worker: "Debate".to_string(),
+            status: "Starting debate session".to_string(),
+        });
 
         // Get advocate, skeptic, and synthesizer from debate_agents
         let advocate = self.config.agents.debate_agents.iter()
@@ -569,6 +653,10 @@ impl ResearchOrchestrator {
         for round in 1..=max_rounds {
             self.send_progress(ResearchProgress::DebateRound(round, max_rounds));
             eprintln!("[Research] Debate round {}/{}", round, max_rounds);
+            self.send_progress(ResearchProgress::WorkerStatus {
+                worker: "Debate".to_string(),
+                status: format!("Advocate presenting arguments (round {}/{})", round, max_rounds),
+            });
 
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
@@ -600,6 +688,16 @@ impl ResearchOrchestrator {
 
             last_advocate_arg = advocate_client.query_streaming(&advocate_prompt, |_| {}).await?;
             eprintln!("[Research] Advocate round {}: presented argument", round);
+            // Log a shortened advocate argument for UI verbosity
+            crate::progress::log_with(
+                crate::progress::Kind::Debate,
+                format!(
+                    "Advocate (round {}/{}): {}",
+                    round,
+                    max_rounds,
+                    Self::summarize_arg(&last_advocate_arg, 140)
+                ),
+            );
 
             // Add to history
             debate_history.push_str(&format!("\n--- Round {} ---\n", round));
@@ -608,6 +706,10 @@ impl ResearchOrchestrator {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
             // Skeptic's turn
+            self.send_progress(ResearchProgress::WorkerStatus {
+                worker: "Debate".to_string(),
+                status: format!("Skeptic challenging (round {}/{})", round, max_rounds),
+            });
             let skeptic_prompt = if round == 1 {
                 // First round: critique the research and advocate's defense
                 format!(
@@ -636,6 +738,16 @@ impl ResearchOrchestrator {
 
             last_skeptic_arg = skeptic_client.query_streaming(&skeptic_prompt, |_| {}).await?;
             eprintln!("[Research] Skeptic round {}: presented critique", round);
+            // Log a shortened skeptic rebuttal
+            crate::progress::log_with(
+                crate::progress::Kind::Debate,
+                format!(
+                    "Skeptic (round {}/{}): {}",
+                    round,
+                    max_rounds,
+                    Self::summarize_arg(&last_skeptic_arg, 140)
+                ),
+            );
 
             // Add to history
             debate_history.push_str(&format!("**Skeptic:**\n{}\n\n", last_skeptic_arg));
@@ -660,7 +772,19 @@ impl ResearchOrchestrator {
 
         let final_decision = synthesizer_client.query_streaming(&synthesizer_prompt, |_| {}).await?;
         eprintln!("[Research] Synthesizer reached decision after {} debate rounds", max_rounds);
-
+        // Log a shortened synthesizer decision
+        crate::progress::log_with(
+            crate::progress::Kind::Debate,
+            format!(
+                "Synthesizer decision: {}",
+                Self::summarize_arg(&final_decision, 140)
+            ),
+        );
+        self.send_progress(ResearchProgress::WorkerStatus {
+            worker: "Debate".to_string(),
+            status: "Synthesizer compiling final decision".to_string(),
+        });
+        
         Ok(final_decision)
     }
 
@@ -672,6 +796,10 @@ impl ResearchOrchestrator {
         for iteration in 0..max_iterations {
             // Write or rewrite the document
             self.send_progress(ResearchProgress::WritingDocument(iteration + 1, max_iterations));
+            self.send_progress(ResearchProgress::WorkerStatus {
+                worker: "Writer".to_string(),
+                status: format!("Drafting document (iteration {}/{})", iteration + 1, max_iterations),
+            });
 
             let document = if iteration == 0 {
                 // First iteration: create initial document from research
@@ -685,6 +813,10 @@ impl ResearchOrchestrator {
 
             // Get document critic feedback
             self.send_progress(ResearchProgress::DocumentReviewing);
+            self.send_progress(ResearchProgress::WorkerStatus {
+                worker: "DocumentCritic".to_string(),
+                status: "Reviewing draft for clarity, correctness, and structure".to_string(),
+            });
             let criticism = self.review_document(original_query, &current_document).await?;
 
             // Check if approved
@@ -704,7 +836,11 @@ impl ResearchOrchestrator {
 
         // Add sources section to the document
         let final_document = self.add_sources_section(&current_document);
-
+        self.send_progress(ResearchProgress::WorkerStatus {
+            worker: "Writer".to_string(),
+            status: "Finalizing document and references".to_string(),
+        });
+        
         Ok(final_document)
     }
 
