@@ -249,14 +249,15 @@ impl ToolExecutor {
         usage.call_count += 1;
         usage.last_call = now;
 
-        // Progressive delay: 0ms, 200ms, 500ms, 1000ms, 2000ms, then cap at 3000ms
+        // Progressive delay: 0ms, 100ms, 250ms, 500ms, 1000ms, then cap at 1500ms
+        // Less aggressive to support research mode with many parallel workers
         let delay_ms = match usage.call_count {
             1 => 0,
-            2 => 200,
-            3 => 500,
-            4 => 1000,
-            5 => 2000,
-            _ => 3000, // Cap at 3 seconds
+            2 => 100,
+            3 => 250,
+            4 => 500,
+            5 => 1000,
+            _ => 1500, // Cap at 1.5 seconds
         };
 
         debug_println!("[RateLimit] {} - Call #{} in window, delay: {}ms",

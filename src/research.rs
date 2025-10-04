@@ -18,7 +18,6 @@ pub enum ResearchProgress {
     Refining(usize, usize), // current iteration, max iterations
     CriticReviewing,
     DebateRound(usize, usize), // current round, max rounds
-    AddingBibliography,
     WritingDocument(usize, usize), // current iteration, max iterations
     DocumentReviewing,
     Completed,
@@ -578,10 +577,6 @@ impl ResearchOrchestrator {
     }
 
     /// Legacy method - kept for compatibility
-    fn add_bibliography(&self, text: &str) -> String {
-        self.add_sources_section(text)
-    }
-
     /// Refinement loop with multi-agent debate
     async fn refinement_loop(&self, initial_output: &str) -> Result<String> {
         let mut current_output = initial_output.to_string();

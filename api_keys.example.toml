@@ -22,5 +22,13 @@ BRAVE_API_KEY = "your_brave_api_key_here"
 # Ollama API Key (for Ollama Cloud)
 OLLAMA_API_KEY = "your_ollama_api_key_here"
 
+# NewsData.io API Key (for news search)
+# Get from: https://newsdata.io/
+NEWSDATA_API_KEY = "your_newsdata_api_key_here"
+
+# Geoapify API Key (for geocoding)
+# Get from: https://www.geoapify.com/
+GEOAPIFY_API_KEY = "your_geoapify_api_key_here"
+
 # Add your custom API keys below
 # MY_CUSTOM_API_KEY = "your_custom_key_here"

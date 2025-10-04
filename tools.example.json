@@ -1,46 +1,176 @@
 {
   "tools": {
+    "builtin": ["pdf_extract"],
     "http": [
       {
         "name": "weather",
-        "description": "Get current weather information for a city",
-        "url": "https://api.openweathermap.org/data/2.5/weather",
+        "description": "Returns current weather conditions and 3-day forecast. Provides temperature (°F), condition (sunny/cloudy/rainy), wind speed/direction, and precipitation. Works with city names, landmarks, airports, or coordinates.",
+        "endpoint": "https://wttr.in/{query}?T&u&format=4",
         "method": "GET",
         "parameters": {
-          "q": "{{city}}",
-          "appid": "$OPENWEATHER_API_KEY",
-          "units": "metric"
+          "query": {
+            "type": "string",
+            "description": "Location query: city name ('London'), landmark ('~Eiffel Tower'), airport code ('LAX'), area code ('90210'), or lat,long coordinates ('34.05,-118.24'). No spaces in coordinates.",
+            "required": true
+          }
         },
-        "expected_status": ["2xx"],
-        "acceptable_status": ["404"],
-        "error_status": []
+        "path_params": ["query"],
+        "response_format": "text",
+        "expected_status": ["2xx", "3xx"],
+        "error_status": ["5xx", "401", "403"],
+        "acceptable_status": ["400"]
       },
       {
-        "name": "search",
-        "description": "Search the web using Brave Search API",
-        "url": "https://api.search.brave.com/res/v1/web/search",
+        "name": "web_search",
+        "description": "Searches the internet for current information, news, facts, or real-time data. Returns search result snippets with titles and URLs. Use for: breaking news, recent events, current prices/stats, trending topics, verification.",
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
         "method": "GET",
-        "headers": {
-          "X-Subscription-Token": "$BRAVE_API_KEY"
-        },
         "parameters": {
-          "q": "{{query}}"
+          "q": {
+            "type": "string",
+            "description": "Search query using natural keywords. Be specific: include dates, names, or context.",
+            "required": true
+          }
         },
-        "expected_status": ["2xx", "3xx"],
-        "error_status": ["401", "403", "5xx"]
+        "headers": {
+          "X-Subscription-Token": "${BRAVE_API_KEY}"
+        },
+        "response_format": "json",
+        "expected_status": ["2xx"],
+        "error_status": ["5xx", "401", "403"],
+        "acceptable_status": ["400"]
+      },
+      {
+        "name": "arxiv_search",
+        "description": "Searches arXiv.org for academic preprints in physics, mathematics, computer science, and related fields. Returns paper titles, authors, abstracts, and PDF URLs. Free, no authentication required.",
+        "endpoint": "http://export.arxiv.org/api/query",
+        "method": "GET",
+        "parameters": {
+          "search_query": {
+            "type": "string",
+            "description": "Search query using arXiv syntax. Prefix fields: 'ti:' (title), 'au:' (author), 'abs:' (abstract), 'all:' (all fields). Examples: 'all:transformer neural network', 'ti:quantum computing'.",
+            "required": true
+          },
+          "max_results": {
+            "type": "string",
+            "description": "Maximum number of results to return (1-100).",
+            "required": false,
+            "default": "10"
+          }
+        },
+        "response_format": "text",
+        "expected_status": ["2xx"],
+        "error_status": ["5xx"],
+        "acceptable_status": ["400"]
+      },
+      {
+        "name": "semantic_scholar",
+        "description": "Searches Semantic Scholar's database of 200+ million academic papers across all disciplines. Returns paper metadata including citations, authors, abstracts, and DOI links. Rate limit: 100 requests per 5 minutes.",
+        "endpoint": "https://api.semanticscholar.org/graph/v1/paper/search",
+        "method": "GET",
+        "parameters": {
+          "query": {
+            "type": "string",
+            "description": "Search query in natural language. Be specific with technical terms. Examples: 'machine learning transformers', 'CRISPR gene editing applications'.",
+            "required": true
+          },
+          "limit": {
+            "type": "string",
+            "description": "Number of results (1-100).",
+            "required": false,
+            "default": "10"
+          },
+          "fields": {
+            "type": "string",
+            "description": "Comma-separated fields to return.",
+            "required": false,
+            "default": "title,authors,year,abstract,citationCount,url,openAccessPdf"
+          }
+        },
+        "response_format": "json",
+        "response_path": "data",
+        "expected_status": ["2xx"],
+        "error_status": ["5xx", "429"],
+        "acceptable_status": ["400"]
+      },
+      {
+        "name": "wikipedia",
+        "description": "Fetches Wikipedia article summaries and full content. Returns verified encyclopedia information with citations. Free, unlimited access. Use for: general knowledge, historical facts, biographies, scientific concepts.",
+        "endpoint": "https://en.wikipedia.org/api/rest_v1/page/summary/{title}",
+        "method": "GET",
+        "parameters": {
+          "title": {
+            "type": "string",
+            "description": "Article title or search term. Use underscores for spaces. Examples: 'Artificial_intelligence', 'Python_(programming_language)', 'New_York_City'.",
+            "required": true
+          }
+        },
+        "path_params": ["title"],
+        "response_format": "json",
+        "expected_status": ["2xx"],
+        "error_status": ["5xx"],
+        "acceptable_status": ["404"]
+      },
+      {
+        "name": "news_search",
+        "description": "Search current and historical news (2017-present) from 84K+ sources worldwide. Returns article titles, descriptions, content, publication dates, and source URLs. Use for: breaking news, historical events, fact verification, temporal research, event timelines, trend analysis.",
+        "endpoint": "https://newsdata.io/api/1/news",
+        "method": "GET",
+        "parameters": {
+          "q": {
+            "type": "string",
+            "description": "Search query with keywords. Supports AND, OR, NOT operators. Examples: 'climate change AND legislation', 'SpaceX launch', 'COVID-19 vaccine NOT misinformation'. Be specific with names and dates.",
+            "required": true
+          },
+          "apikey": {
+            "type": "string",
+            "description": "NewsData.io API key",
+            "required": true,
+            "default": "${NEWSDATA_API_KEY}"
+          },
+          "language": {
+            "type": "string",
+            "description": "Language code. Common: en (English), es (Spanish), fr (French), de (German), zh (Chinese)",
+            "required": false,
+            "default": "en"
+          },
+          "from_date": {
+            "type": "string",
+            "description": "Start date for historical search (YYYY-MM-DD format). Goes back to 2017. Example: '2020-01-01'",
+            "required": false
+          },
+          "to_date": {
+            "type": "string",
+            "description": "End date (YYYY-MM-DD format). Example: '2024-12-31'",
+            "required": false
+          }
+        },
+        "response_format": "json",
+        "expected_status": ["2xx"],
+        "error_status": ["5xx", "401", "403", "429"],
+        "acceptable_status": ["400"]
       },
       {
         "name": "github_user",
         "description": "Get information about a GitHub user",
-        "url": "https://api.github.com/users/{{username}}",
+        "endpoint": "https://api.github.com/users/{username}",
         "method": "GET",
+        "parameters": {
+          "username": {
+            "type": "string",
+            "description": "GitHub username",
+            "required": true
+          }
+        },
+        "path_params": ["username"],
         "headers": {
-          "Authorization": "token $GITHUB_TOKEN",
+          "Authorization": "Bearer ${GITHUB_TOKEN}",
           "Accept": "application/vnd.github.v3+json"
         },
-        "expected_status": ["200", "201"],
-        "acceptable_status": ["404"],
-        "error_status": ["4xx", "5xx"]
+        "response_format": "json",
+        "expected_status": ["2xx"],
+        "error_status": ["5xx"],
+        "acceptable_status": ["404"]
       }
     ],
     "mcp": []
