@@ -18,12 +18,24 @@ fn default_max_document_iterations() -> usize {
     3
 }
 
-fn default_worker_count() -> usize {
+fn default_min_worker_count() -> usize {
     3
+}
+
+fn default_max_worker_count() -> usize {
+    10
 }
 
 fn default_max_debate_rounds() -> usize {
     2
+}
+
+fn default_embedding_model() -> String {
+    "nomic-embed-text".to_string()
+}
+
+fn default_embedding_dimensions() -> usize {
+    768
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -41,7 +53,19 @@ fn default_research_model() -> Option<String> {
     None // Will use main model if not specified
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+fn default_summarization_model() -> Option<String> {
+    None // Will use main model if not specified
+}
+
+fn default_summarization_threshold() -> usize {
+    5000
+}
+
+fn default_summarization_threshold_research() -> usize {
+    10000
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OllamaConfig {
     pub host: String,
     pub model: String,
@@ -49,31 +73,48 @@ pub struct OllamaConfig {
     pub vision_model: String,
     #[serde(default = "default_research_model")]
     pub research_model: Option<String>,
-    #[serde(default = "default_context_window")]
-    pub context_window: usize,
-    #[serde(default = "default_max_tool_turns")]
-    pub max_tool_turns: usize,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ResearchConfig {
+    #[serde(default = "default_summarization_model")]
+    pub summarization_model: Option<String>,
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
+    #[serde(default = "default_embedding_dimensions")]
+    pub embedding_dimensions: usize,
     #[serde(default = "default_max_refinement_iterations")]
     pub max_refinement_iterations: usize,
     #[serde(default = "default_max_document_iterations")]
     pub max_document_iterations: usize,
-    #[serde(default = "default_worker_count")]
-    pub worker_count: usize,
     #[serde(default = "default_max_debate_rounds")]
     pub max_debate_rounds: usize,
+    #[serde(default = "default_context_window")]
+    pub context_window: usize,
+    #[serde(default = "default_max_tool_turns")]
+    pub max_tool_turns: usize,
+    #[serde(default = "default_summarization_threshold")]
+    pub summarization_threshold: usize,
+    #[serde(default = "default_summarization_threshold_research")]
+    pub summarization_threshold_research: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ResearchConfig {
+    #[serde(default = "default_min_worker_count")]
+    pub min_worker_count: usize,
+    #[serde(default = "default_max_worker_count")]
+    pub max_worker_count: usize,
+    #[serde(default = "default_export_memories")]
+    pub export_memories: bool,
+}
+
+fn default_export_memories() -> bool {
+    false
 }
 
 impl Default for ResearchConfig {
     fn default() -> Self {
         ResearchConfig {
-            max_refinement_iterations: 5,
-            max_document_iterations: 3,
-            worker_count: 3,
-            max_debate_rounds: 2,
+            min_worker_count: 3,
+            max_worker_count: 10,
+            export_memories: false,
         }
     }
 }
@@ -86,8 +127,16 @@ impl Default for Config {
                 model: "llama2".to_string(),
                 vision_model: "llama3.2-vision:11b".to_string(),
                 research_model: None,
+                summarization_model: None,
+                embedding_model: "nomic-embed-text".to_string(),
+                embedding_dimensions: 768,
+                max_refinement_iterations: 5,
+                max_document_iterations: 3,
+                max_debate_rounds: 2,
                 context_window: 128000,
                 max_tool_turns: 5,
+                summarization_threshold: 5000,
+                summarization_threshold_research: 10000,
             },
             research: ResearchConfig::default(),
         }

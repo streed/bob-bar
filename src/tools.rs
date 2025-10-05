@@ -134,6 +134,9 @@ pub struct ToolExecutor {
     mcp_tools: StdMutex<HashMap<String, Vec<McpTool>>>,  // Store discovered MCP tools per server
     api_keys: HashMap<String, String>,
     tool_usage: StdMutex<HashMap<String, ToolUsage>>,  // Track usage per tool (with interior mutability)
+    shared_memory: Option<std::sync::Arc<crate::shared_memory::SharedMemory>>,  // Optional shared memory for research mode
+    query_id: StdMutex<Option<String>>,  // Current research query ID for tracking history
+    agent_name: StdMutex<Option<String>>,  // Current agent name for tool call tracking
 }
 
 // Track current HTTP sources for UI verbosity
@@ -183,12 +186,52 @@ impl ToolExecutor {
             mcp_tools: StdMutex::new(HashMap::new()),
             api_keys,
             tool_usage: StdMutex::new(HashMap::new()),
+            shared_memory: None,
+            query_id: StdMutex::new(None),
+            agent_name: StdMutex::new(None),
         };
 
         // Register built-in tools
         executor.register_builtin_tools();
 
         executor
+    }
+
+    pub fn set_shared_memory(&mut self, memory: std::sync::Arc<crate::shared_memory::SharedMemory>) {
+        self.shared_memory = Some(memory);
+    }
+
+    pub fn set_query_id(&mut self, query_id: String) {
+        if let Ok(mut id) = self.query_id.lock() {
+            *id = Some(query_id);
+        }
+    }
+
+    pub fn set_agent_name(&mut self, agent_name: String) {
+        if let Ok(mut name) = self.agent_name.lock() {
+            *name = Some(agent_name);
+        }
+    }
+
+    pub fn get_query_id(&self) -> Option<String> {
+        self.query_id.lock().ok().and_then(|id| id.clone())
+    }
+
+    /// Record a tool call to shared memory (non-blocking)
+    async fn record_tool_call(&self, tool_type: &str, tool_name: &str, parameters: &str) {
+        if let Some(ref memory) = self.shared_memory {
+            let query_id = self.get_query_id();
+            let agent_name = self.agent_name.lock().ok().and_then(|n| n.clone()).unwrap_or_else(|| "unknown".to_string());
+
+            // Fire and forget - don't block on recording
+            let _ = memory.record_tool_call(
+                query_id,
+                agent_name,
+                tool_type.to_string(),
+                tool_name.to_string(),
+                parameters.to_string(),
+            ).await;
+        }
     }
 
     fn register_builtin_tools(&mut self) {
@@ -198,6 +241,7 @@ impl ToolExecutor {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_builtin_tool(&self, tool_name: &str) -> bool {
         self.config.tools.builtin.contains(&tool_name.to_string())
     }
@@ -556,6 +600,10 @@ impl ToolExecutor {
     pub async fn execute_http_tool(&self, tool_name: &str, params: HashMap<String, String>)
         -> Result<Value, anyhow::Error> {
 
+        // Record tool call
+        let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+        self.record_tool_call("http", tool_name, &params_json).await;
+
         // Apply rate limiting
         self.apply_rate_limit(tool_name).await;
 
@@ -762,6 +810,11 @@ impl ToolExecutor {
     pub async fn execute_mcp_tool(&self, server_name: &str, tool_name: &str, params: Value)
         -> Result<Value, anyhow::Error> {
 
+        // Record tool call
+        let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+        let full_tool_name = format!("{}:{}", server_name, tool_name);
+        self.record_tool_call("mcp", &full_tool_name, &params_json).await;
+
         // Apply rate limiting using combined name
         let rate_limit_key = format!("{}:{}", server_name, tool_name);
         self.apply_rate_limit(&rate_limit_key).await;
@@ -796,8 +849,21 @@ impl ToolExecutor {
     pub async fn execute_builtin_tool(&self, tool_name: &str, params: HashMap<String, String>)
         -> Result<Value, anyhow::Error> {
 
+        // Record tool call
+        let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+        self.record_tool_call("builtin", tool_name, &params_json).await;
+
         match tool_name {
             "pdf_extract" => self.builtin_pdf_extract(params).await,
+            "memory_store" => self.builtin_memory_store(params).await,
+            "memory_search" => self.builtin_memory_search(params).await,
+            "memory_get_discoveries" => self.builtin_memory_get_discoveries(params).await,
+            "memory_get_deadends" => self.builtin_memory_get_deadends(params).await,
+            "memory_get_insights" => self.builtin_memory_get_insights(params).await,
+            "memory_get_feedback" => self.builtin_memory_get_feedback(params).await,
+            "memory_get_plan" => self.builtin_memory_get_plan(params).await,
+            "memory_stats" => self.builtin_memory_stats(params).await,
+            "current_date" => self.builtin_current_date(params).await,
             _ => Err(anyhow::anyhow!("Unknown built-in tool: {}", tool_name)),
         }
     }
@@ -831,6 +897,225 @@ impl ToolExecutor {
         }))
     }
 
+    async fn builtin_memory_store(&self, params: HashMap<String, String>) -> Result<Value, anyhow::Error> {
+        let memory = self.shared_memory.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Shared memory not available"))?;
+
+        let memory_type_str = params.get("type")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'type' parameter"))?;
+        let content = params.get("content")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
+        let created_by = params.get("agent")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'agent' parameter"))?;
+
+        let memory_type = crate::shared_memory::MemoryType::from_str(memory_type_str)
+            .ok_or_else(|| anyhow::anyhow!("Invalid memory type: {}", memory_type_str))?;
+
+        let mut metadata = HashMap::new();
+
+        // Include query_id in metadata for history tracking
+        if let Some(query_id) = self.get_query_id() {
+            metadata.insert("query_id".to_string(), query_id);
+        }
+
+        if let Some(tags) = params.get("tags") {
+            metadata.insert("tags".to_string(), tags.clone());
+        }
+
+        let id = memory.store_memory(
+            memory_type,
+            content.clone(),
+            created_by.clone(),
+            Some(metadata)
+        ).await?;
+
+        debug_println!("[Memory] Stored {} by {}: {} chars", memory_type_str, created_by, content.len());
+
+        Ok(json!({
+            "success": true,
+            "memory_id": id,
+            "type": memory_type_str
+        }))
+    }
+
+    async fn builtin_memory_search(&self, params: HashMap<String, String>) -> Result<Value, anyhow::Error> {
+        let memory = self.shared_memory.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Shared memory not available"))?;
+
+        let query = params.get("query")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'query' parameter"))?;
+
+        let memory_type = params.get("type")
+            .and_then(|t| crate::shared_memory::MemoryType::from_str(t));
+
+        let top_k = params.get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(5);
+
+        let results = memory.search_similar(query, memory_type, top_k).await?;
+
+        debug_println!("[Memory] Search for '{}' found {} results", query, results.len());
+
+        Ok(json!({
+            "results": results.iter().map(|m| json!({
+                "type": m.memory_type.as_str(),
+                "content": m.content,
+                "created_by": m.created_by,
+                "metadata": m.metadata
+            })).collect::<Vec<_>>(),
+            "count": results.len()
+        }))
+    }
+
+    async fn builtin_memory_get_discoveries(&self, _params: HashMap<String, String>) -> Result<Value, anyhow::Error> {
+        let memory = self.shared_memory.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Shared memory not available"))?;
+
+        let discoveries = memory.get_by_type(crate::shared_memory::MemoryType::Discovery).await;
+
+        Ok(json!({
+            "discoveries": discoveries.iter().map(|m| json!({
+                "content": m.content,
+                "created_by": m.created_by,
+                "metadata": m.metadata
+            })).collect::<Vec<_>>(),
+            "count": discoveries.len()
+        }))
+    }
+
+    async fn builtin_memory_get_deadends(&self, _params: HashMap<String, String>) -> Result<Value, anyhow::Error> {
+        let memory = self.shared_memory.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Shared memory not available"))?;
+
+        let deadends = memory.get_by_type(crate::shared_memory::MemoryType::Deadend).await;
+
+        Ok(json!({
+            "deadends": deadends.iter().map(|m| json!({
+                "content": m.content,
+                "created_by": m.created_by,
+                "metadata": m.metadata
+            })).collect::<Vec<_>>(),
+            "count": deadends.len()
+        }))
+    }
+
+    async fn builtin_memory_get_insights(&self, _params: HashMap<String, String>) -> Result<Value, anyhow::Error> {
+        let memory = self.shared_memory.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Shared memory not available"))?;
+
+        let insights = memory.get_by_type(crate::shared_memory::MemoryType::Insight).await;
+
+        Ok(json!({
+            "insights": insights.iter().map(|m| json!({
+                "content": m.content,
+                "created_by": m.created_by,
+                "metadata": m.metadata
+            })).collect::<Vec<_>>(),
+            "count": insights.len()
+        }))
+    }
+
+    async fn builtin_memory_get_feedback(&self, _params: HashMap<String, String>) -> Result<Value, anyhow::Error> {
+        let memory = self.shared_memory.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Shared memory not available"))?;
+
+        let feedback = memory.get_by_type(crate::shared_memory::MemoryType::Feedback).await;
+
+        Ok(json!({
+            "feedback": feedback.iter().map(|m| json!({
+                "content": m.content,
+                "created_by": m.created_by,
+                "metadata": m.metadata
+            })).collect::<Vec<_>>(),
+            "count": feedback.len()
+        }))
+    }
+
+    async fn builtin_memory_get_plan(&self, _params: HashMap<String, String>) -> Result<Value, anyhow::Error> {
+        let memory = self.shared_memory.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Shared memory not available"))?;
+
+        let plans = memory.get_by_type(crate::shared_memory::MemoryType::Plan).await;
+
+        // Return the most recent plan
+        let plan = plans.first();
+
+        Ok(json!({
+            "plan": plan.map(|p| p.content.clone()).unwrap_or_else(|| "No plan found".to_string()),
+            "created_by": plan.map(|p| p.created_by.clone()).unwrap_or_else(|| "unknown".to_string())
+        }))
+    }
+
+    async fn builtin_memory_stats(&self, _params: HashMap<String, String>) -> Result<Value, anyhow::Error> {
+        let memory = self.shared_memory.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Shared memory not available"))?;
+
+        let stats = memory.get_stats().await;
+
+        Ok(json!({
+            "total": stats.total_count,
+            "discoveries": stats.discovery_count,
+            "insights": stats.insight_count,
+            "deadends": stats.deadend_count,
+            "cached_queries": stats.query_result_count,
+            "plans": stats.plan_count,
+            "feedback": stats.feedback_count,
+            "context": stats.context_count
+        }))
+    }
+
+    async fn builtin_current_date(&self, _params: HashMap<String, String>) -> Result<Value, anyhow::Error> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now();
+        let timestamp = now.duration_since(UNIX_EPOCH)
+            .map_err(|e| anyhow::anyhow!("System time error: {}", e))?
+            .as_secs();
+
+        // Convert timestamp to date components (UTC)
+        // Using algorithm from: https://howardhinnant.github.io/date_algorithms.html
+        let days_since_epoch = (timestamp / 86400) as i64;
+        let z = days_since_epoch + 719468; // Days from 0000-03-01 to 1970-01-01
+        let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+        let doe = (z - era * 146097) as u32; // Day of era
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // Year of era
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // Day of year
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if m <= 2 { y + 1 } else { y };
+        let month = m;
+        let day = d;
+
+        // Time components
+        let seconds_today = timestamp % 86400;
+        let hour = seconds_today / 3600;
+        let minute = (seconds_today % 3600) / 60;
+        let second = seconds_today % 60;
+
+        // Format as ISO 8601: YYYY-MM-DDTHH:MM:SSZ
+        let iso8601 = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            year, month, day, hour, minute, second);
+
+        // Human-friendly format: Month DD, YYYY
+        let month_names = ["January", "February", "March", "April", "May", "June",
+                          "July", "August", "September", "October", "November", "December"];
+        let month_name = month_names[(month - 1) as usize];
+        let friendly = format!("{} {}, {}", month_name, day, year);
+
+        debug_println!("[BuiltIn:Date] Current date: {}", iso8601);
+
+        Ok(json!({
+            "iso8601": iso8601,
+            "friendly": friendly,
+            "timestamp": timestamp,
+            "year": year,
+            "month": month,
+            "day": day
+        }))
+    }
+
 
     pub fn get_tool_descriptions(&self) -> Vec<ToolDescription> {
         let mut descriptions = Vec::new();
@@ -846,6 +1131,86 @@ impl ToolExecutor {
                         description: "URL of the PDF file to extract text from. Must be a valid HTTP/HTTPS URL pointing to a PDF document.".to_string(),
                         required: true,
                     }]
+                ),
+                "memory_store" => (
+                    "Store a new memory in shared memory for other agents to access. Types: discovery (key findings), insight (observations), deadend (failed approaches), context (general notes), feedback (agent feedback).".to_string(),
+                    vec![
+                        ParameterDescription {
+                            name: "type".to_string(),
+                            param_type: "string".to_string(),
+                            description: "Memory type: discovery, insight, deadend, context, or feedback".to_string(),
+                            required: true,
+                        },
+                        ParameterDescription {
+                            name: "content".to_string(),
+                            param_type: "string".to_string(),
+                            description: "The content/text of the memory to store".to_string(),
+                            required: true,
+                        },
+                        ParameterDescription {
+                            name: "agent".to_string(),
+                            param_type: "string".to_string(),
+                            description: "Your agent name/role".to_string(),
+                            required: true,
+                        },
+                        ParameterDescription {
+                            name: "tags".to_string(),
+                            param_type: "string".to_string(),
+                            description: "Optional comma-separated tags for categorization".to_string(),
+                            required: false,
+                        },
+                    ]
+                ),
+                "memory_search" => (
+                    "Search shared memory for similar content using semantic search. Returns top matching memories.".to_string(),
+                    vec![
+                        ParameterDescription {
+                            name: "query".to_string(),
+                            param_type: "string".to_string(),
+                            description: "Search query text".to_string(),
+                            required: true,
+                        },
+                        ParameterDescription {
+                            name: "type".to_string(),
+                            param_type: "string".to_string(),
+                            description: "Optional: filter by memory type (discovery, insight, deadend, etc)".to_string(),
+                            required: false,
+                        },
+                        ParameterDescription {
+                            name: "limit".to_string(),
+                            param_type: "number".to_string(),
+                            description: "Maximum number of results (default: 5)".to_string(),
+                            required: false,
+                        },
+                    ]
+                ),
+                "memory_get_discoveries" => (
+                    "Get all discoveries stored by any agent. Useful to see what other agents have learned.".to_string(),
+                    vec![]
+                ),
+                "memory_get_deadends" => (
+                    "Get all deadends/failed approaches from any agent. Helps avoid repeating failed attempts.".to_string(),
+                    vec![]
+                ),
+                "memory_get_insights" => (
+                    "Get all insights recorded by any agent. Access important observations from other workers.".to_string(),
+                    vec![]
+                ),
+                "memory_get_feedback" => (
+                    "Get feedback from the supervisor monitoring research progress. Check for guidance and warnings.".to_string(),
+                    vec![]
+                ),
+                "memory_get_plan" => (
+                    "Get the research plan for this query. Shows the strategy and sub-questions assigned.".to_string(),
+                    vec![]
+                ),
+                "memory_stats" => (
+                    "Get statistics about shared memory usage (counts of each memory type).".to_string(),
+                    vec![]
+                ),
+                "current_date" => (
+                    "Get the current date and time. Returns both ISO 8601 format (iso8601) and human-friendly format (friendly: 'October 04, 2025'). Use friendly format for search queries and API calls that expect readable dates. No parameters required.".to_string(),
+                    vec![]
                 ),
                 _ => continue,
             };

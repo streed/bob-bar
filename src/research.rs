@@ -12,6 +12,7 @@ pub enum ResearchProgress {
     Decomposing,
     WorkersStarted(usize), // number of workers
     WorkerCompleted(String), // worker name
+    #[allow(dead_code)]
     WorkerStarted { worker: String, question: String },
     WorkerStatus { worker: String, status: String },
     Combining,
@@ -50,19 +51,15 @@ pub struct AgentRole {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResearchConfig {
-    pub max_refinement_iterations: usize,
-    pub max_document_iterations: usize,
-    pub worker_count: usize,
-    pub max_debate_rounds: usize,
+    pub min_worker_count: usize,
+    pub max_worker_count: usize,
 }
 
 impl Default for ResearchConfig {
     fn default() -> Self {
         Self {
-            max_refinement_iterations: 5,
-            max_document_iterations: 3,
-            worker_count: 3,
-            max_debate_rounds: 2,
+            min_worker_count: 3,
+            max_worker_count: 10,
         }
     }
 }
@@ -82,43 +79,74 @@ pub struct WorkerResult {
 
 pub struct ResearchOrchestrator {
     config: AgentsConfig,
+    ollama_config: crate::config::OllamaConfig,
     base_client: Arc<Mutex<OllamaClient>>,
     tool_executor: Option<Arc<Mutex<ToolExecutor>>>,
+    shared_memory: Option<Arc<crate::shared_memory::SharedMemory>>,
     progress_tx: Option<mpsc::UnboundedSender<ResearchProgress>>,
     context_window: usize,
     research_model: String,
     max_tool_turns: usize,
+    query_id: Option<String>,  // Current research query ID for tracking history
+    export_memories: bool,  // Whether to export memory summary to output
 }
 
 impl ResearchOrchestrator {
-    pub fn new(config: AgentsConfig, base_client: Arc<Mutex<OllamaClient>>, context_window: usize, research_model: String, max_tool_turns: usize) -> Self {
+    pub fn new(config: AgentsConfig, ollama_config: crate::config::OllamaConfig, base_client: Arc<Mutex<OllamaClient>>, context_window: usize, research_model: String, max_tool_turns: usize) -> Self {
+        // Initialize shared memory with embedding configuration
+        let shared_memory = match crate::shared_memory::SharedMemory::new(
+            ollama_config.host.clone(),
+            ollama_config.embedding_model.clone(),
+            ollama_config.embedding_dimensions,
+        ) {
+            Ok(mem) => {
+                eprintln!("✓ Shared memory initialized successfully");
+                Some(Arc::new(mem))
+            }
+            Err(e) => {
+                eprintln!("⚠ Warning: Could not initialize shared memory: {}", e);
+                eprintln!("  Research will continue without memory features");
+                None
+            }
+        };
+
         Self {
             config,
+            ollama_config,
             base_client,
             tool_executor: None,
+            shared_memory,
             progress_tx: None,
             context_window,
             research_model,
             max_tool_turns,
+            query_id: None,
+            export_memories: false,  // Default, will be overridden by config
         }
     }
 
-    pub fn from_file(path: &std::path::Path, base_client: Arc<Mutex<OllamaClient>>, context_window: usize, research_model: String, max_tool_turns: usize) -> Result<Self> {
+    pub fn from_file(path: &std::path::Path, ollama_config: crate::config::OllamaConfig, base_client: Arc<Mutex<OllamaClient>>, context_window: usize, research_model: String, max_tool_turns: usize) -> Result<Self> {
         let config_str = std::fs::read_to_string(path)?;
         let config: AgentsConfig = serde_json::from_str(&config_str)?;
-        Ok(Self::new(config, base_client, context_window, research_model, max_tool_turns))
+        Ok(Self::new(config, ollama_config, base_client, context_window, research_model, max_tool_turns))
     }
 
     /// Override config values from global config.toml
     pub fn override_config(&mut self, toml_config: &crate::config::ResearchConfig) {
-        // Override with values from config.toml if they differ from defaults
-        self.config.config.max_refinement_iterations = toml_config.max_refinement_iterations;
-        self.config.config.max_document_iterations = toml_config.max_document_iterations;
-        self.config.config.worker_count = toml_config.worker_count;
-        self.config.config.max_debate_rounds = toml_config.max_debate_rounds;
+        // Override worker count range from research config
+        self.config.config.min_worker_count = toml_config.min_worker_count;
+        self.config.config.max_worker_count = toml_config.max_worker_count;
+        // Override export_memories setting
+        self.export_memories = toml_config.export_memories;
     }
 
     pub fn set_tool_executor(&mut self, executor: Arc<Mutex<ToolExecutor>>) {
+        // Set shared memory on the tool executor if available
+        if let Some(ref shared_memory) = self.shared_memory {
+            if let Ok(mut exec) = executor.try_lock() {
+                exec.set_shared_memory(shared_memory.clone());
+            }
+        }
         self.tool_executor = Some(executor);
     }
 
@@ -153,7 +181,6 @@ impl ResearchOrchestrator {
             ResearchProgress::Refining(i, max) => (format!("Refining output (iteration {}/{})", i, max), Kind::Refiner),
             ResearchProgress::CriticReviewing => ("Critic reviewing output".to_string(), Kind::Debate),
             ResearchProgress::DebateRound(i, max) => (format!("Debate round {}/{}", i, max), Kind::Debate),
-            ResearchProgress::AddingBibliography => ("Adding bibliography".to_string(), Kind::Writer),
             ResearchProgress::WritingDocument(i, max) => (format!("Writing document (iteration {}/{})", i, max), Kind::Writer),
             ResearchProgress::DocumentReviewing => ("Document critic reviewing".to_string(), Kind::DocumentCritic),
             ResearchProgress::Completed => ("Research complete".to_string(), Kind::Info),
@@ -172,19 +199,67 @@ impl ResearchOrchestrator {
 
     /// Main entry point for research mode
     pub async fn research(&mut self, query: &str) -> Result<String> {
+        // Generate unique query ID for this research session using timestamp + random
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let random: u32 = (timestamp % 10000) as u32; // Simple pseudo-random from timestamp
+        let query_id = format!("query_{}_{}", timestamp, random);
+        self.query_id = Some(query_id.clone());
+
+        // Set query_id on tool executor for memory tools
+        if let Some(ref executor) = self.tool_executor {
+            if let Ok(mut exec) = executor.try_lock() {
+                exec.set_query_id(query_id.clone());
+            }
+        }
+
+        eprintln!("[Research] Starting query: {} (ID: {})", query, query_id);
         self.send_progress(ResearchProgress::Started);
 
-        // Step 1: Decompose query into sub-questions
+        // Step 1: Decompose query into sub-questions and create plan
         self.send_progress(ResearchProgress::Decomposing);
-        let sub_questions = self.decompose_query(query).await?;
+        let (sub_questions, plan) = self.decompose_query_and_plan(query).await?;
 
         if sub_questions.is_empty() {
             return Ok("Unable to decompose query into sub-questions.".to_string());
         }
 
-        // Step 2: Execute workers in parallel
+        // Store the initial plan in shared memory
+        if let Some(ref shared_memory) = self.shared_memory {
+            let plan_content = format!(
+                "Research Plan for: {}\n\nSub-questions:\n{}\n\nStrategy:\n{}",
+                query,
+                sub_questions.iter().enumerate()
+                    .map(|(i, sq)| format!("{}. [{}] {}", i + 1, sq.assigned_worker, sq.question))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                plan
+            );
+
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("query_text".to_string(), query.to_string());
+            // Add query_id for session tracking
+            if let Some(ref qid) = self.query_id {
+                metadata.insert("query_id".to_string(), qid.clone());
+            }
+
+            match shared_memory.store_memory(
+                crate::shared_memory::MemoryType::Plan,
+                plan_content,
+                "lead_researcher".to_string(),
+                Some(metadata)
+            ).await {
+                Ok(_) => eprintln!("[Research] Plan stored in shared memory"),
+                Err(e) => eprintln!("[Research] Warning: Failed to store plan: {}", e),
+            }
+        }
+
+        // Step 2: Execute workers with iterative refinement and supervisor monitoring
         self.send_progress(ResearchProgress::WorkersStarted(sub_questions.len()));
-        let worker_results = self.execute_workers(&sub_questions).await?;
+        let worker_results = self.execute_workers_with_refinement(&sub_questions, query).await?;
 
         // Step 3: Combine results (with summarization if needed)
         self.send_progress(ResearchProgress::Combining);
@@ -194,17 +269,143 @@ impl ResearchOrchestrator {
         let refined_output = self.refinement_loop(&combined_output).await?;
 
         // Step 5: Document writing loop with document critic
-        let final_document = self.document_writing_loop(query, &refined_output).await?;
+        let mut final_document = self.document_writing_loop(query, &refined_output).await?;
+
+        // Step 6: Optionally append memory summary and clear database
+        if let Some(ref shared_memory) = self.shared_memory {
+            // Check config for memory export
+            if self.export_memories {
+                // Get all memories from current query
+                let stats = shared_memory.get_stats().await;
+                let discoveries = shared_memory.get_by_type(crate::shared_memory::MemoryType::Discovery).await;
+                let insights = shared_memory.get_by_type(crate::shared_memory::MemoryType::Insight).await;
+                let deadends = shared_memory.get_by_type(crate::shared_memory::MemoryType::Deadend).await;
+                let feedback = shared_memory.get_by_type(crate::shared_memory::MemoryType::Feedback).await;
+
+                // Get tool calls for this query
+                let tool_calls = shared_memory.get_tool_calls(self.query_id.as_deref()).await.unwrap_or_default();
+
+                // Group tool calls by agent
+                let mut agent_tool_calls: std::collections::HashMap<String, Vec<&crate::shared_memory::ToolCall>> = std::collections::HashMap::new();
+                for tc in &tool_calls {
+                    agent_tool_calls.entry(tc.agent_name.clone()).or_default().push(tc);
+                }
+
+                // Format tool calls section
+                let tool_calls_section = if !agent_tool_calls.is_empty() {
+                    let mut sections = vec!["### Tool Usage by Agent\n".to_string()];
+                    let mut sorted_agents: Vec<_> = agent_tool_calls.keys().collect();
+                    sorted_agents.sort();
+
+                    for agent_name in sorted_agents {
+                        let calls = &agent_tool_calls[agent_name];
+                        sections.push(format!("\n**{}**:\n", agent_name));
+                        for tc in calls {
+                            // Parse parameters for better display
+                            let params_display = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&tc.parameters) {
+                                if let Some(obj) = parsed.as_object() {
+                                    if obj.is_empty() {
+                                        "(no params)".to_string()
+                                    } else {
+                                        let params_str: Vec<String> = obj.iter()
+                                            .map(|(k, v)| {
+                                                let val_str = match v {
+                                                    serde_json::Value::String(s) => {
+                                                        if s.len() > 50 {
+                                                            format!("{}...", &s[..50])
+                                                        } else {
+                                                            s.clone()
+                                                        }
+                                                    },
+                                                    _ => v.to_string()
+                                                };
+                                                format!("{}={}", k, val_str)
+                                            })
+                                            .collect();
+                                        format!("({})", params_str.join(", "))
+                                    }
+                                } else {
+                                    tc.parameters.clone()
+                                }
+                            } else {
+                                tc.parameters.clone()
+                            };
+                            sections.push(format!("  - `[{}] {}` {}\n", tc.tool_type, tc.tool_name, params_display));
+                        }
+                    }
+                    sections.join("")
+                } else {
+                    "### Tool Usage\n\nNo tools were used during this research.\n".to_string()
+                };
+
+                // Append memory summary to document
+                let memory_summary = format!(
+                    "\n\n---\n\n## Research Memory Summary\n\n\
+                    **Total Memories**: {} (Discoveries: {}, Insights: {}, Deadends: {}, Feedback: {})\n\n\
+                    {}\n\
+                    ### Discoveries ({})\n\n{}\n\n\
+                    ### Insights ({})\n\n{}\n\n\
+                    ### Deadends ({})\n\n{}\n\n\
+                    ### Supervisor Feedback ({})\n\n{}\n",
+                    stats.total_count,
+                    stats.discovery_count,
+                    stats.insight_count,
+                    stats.deadend_count,
+                    stats.feedback_count,
+                    tool_calls_section,
+                    discoveries.len(),
+                    discoveries.iter()
+                        .map(|d| format!("- **[{}]**: {}", d.created_by, d.content))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    insights.len(),
+                    insights.iter()
+                        .map(|i| format!("- **[{}]**: {}", i.created_by, i.content))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    deadends.len(),
+                    deadends.iter()
+                        .map(|d| format!("- **[{}]**: {}", d.created_by, d.content))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    feedback.len(),
+                    feedback.iter()
+                        .map(|f| format!("- **Iteration {}**: {}",
+                            f.metadata.get("iteration").unwrap_or(&"?".to_string()),
+                            f.content))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+
+                final_document.push_str(&memory_summary);
+                eprintln!("[Research] Memory summary appended to output");
+            }
+
+            // Clear memories for this query
+            match shared_memory.clear().await {
+                Ok(_) => eprintln!("[Research] Shared memory cleared for next query"),
+                Err(e) => eprintln!("[Research] Warning: Failed to clear memory: {}", e),
+            }
+        }
 
         self.send_progress(ResearchProgress::Completed);
         Ok(final_document)
     }
 
-    /// Decompose query into sub-questions using lead agent
-    async fn decompose_query(&self, query: &str) -> Result<Vec<SubQuestion>> {
+    /// Decompose query into sub-questions and create research plan using lead agent
+    async fn decompose_query_and_plan(&self, query: &str) -> Result<(Vec<SubQuestion>, String)> {
         let prompt = format!(
-            "{}\n\nQuery: {}",
+            "{}\n\n**WORKER COUNT GUIDANCE**: Based on query complexity, create between {} and {} sub-questions. \
+            Simple queries should use fewer workers (closer to {}), while complex multi-faceted queries should \
+            use more workers (closer to {}). The number of sub-questions determines how many workers will be spawned.\n\n\
+            Query: {}\n\nProvide your response in two parts:\n\
+            1. JSON array of sub-questions (as before)\n\
+            2. After the JSON, provide a brief research strategy/plan explaining the approach and what to focus on.",
             self.config.agents.lead.system_prompt,
+            self.config.config.min_worker_count,
+            self.config.config.max_worker_count,
+            self.config.config.min_worker_count,
+            self.config.config.max_worker_count,
             query
         );
 
@@ -228,13 +429,20 @@ impl ResearchOrchestrator {
 
         let assignments: Vec<QuestionAssignment> = serde_json::from_str(&cleaned)?;
 
+        // Extract plan/strategy (everything after the JSON array)
+        let plan = if let Some(json_end) = response.rfind(']') {
+            response[json_end + 1..].trim().to_string()
+        } else {
+            "Follow standard research approach.".to_string()
+        };
+
         // Log the planner's decisions in debug mode
         if std::env::var("BOBBAR_DEBUG").is_ok() {
             eprintln!("\n[Research Planner] Decomposed query into {} sub-questions:", assignments.len());
             for (i, assignment) in assignments.iter().enumerate() {
                 eprintln!("  {}. [{}] {}", i + 1, assignment.worker, assignment.question);
             }
-            eprintln!();
+            eprintln!("\n[Research Strategy] {}\n", plan);
         }
 
         // Map worker role to actual worker name
@@ -258,10 +466,623 @@ impl ResearchOrchestrator {
             });
         }
 
-        Ok(sub_questions)
+        Ok((sub_questions, plan))
+    }
+
+    /// Generate follow-up questions based on early worker results (static version for use in spawned tasks)
+    async fn generate_follow_up_questions_static(
+        original_query: &str,
+        early_results: &[WorkerResult],
+        research_model: &str,
+        max_tool_turns: usize,
+        _ollama_config: &crate::config::OllamaConfig,
+    ) -> Result<Vec<SubQuestion>> {
+        if early_results.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Summarize early findings
+        let early_findings = early_results.iter()
+            .map(|r| format!("Worker: {}\nQuestion: {}\nKey Findings: {}",
+                r.worker_name,
+                r.question,
+                // Truncate to first 300 chars to keep prompt manageable
+                r.answer.chars().take(300).collect::<String>()
+            ))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let prompt = format!(
+            "You are analyzing early research findings to identify gaps and opportunities.\n\n\
+            ORIGINAL QUERY: {}\n\n\
+            EARLY RESEARCH FINDINGS (first {} workers completed):\n{}\n\n\
+            Based on these early findings, generate 2-4 follow-up questions to:\n\
+            1. Fill gaps in coverage that early results revealed\n\
+            2. Resolve any contradictions or inconsistencies\n\
+            3. Explore promising areas more deeply\n\
+            4. Investigate new angles that emerged from findings\n\n\
+            CRITICAL: Return ONLY valid JSON array. No markdown, no text, no code blocks.\n\
+            Format: [{{\"question\": \"...\", \"worker\": \"...\"}}]\n\n\
+            Available workers: web_researcher, technical_analyst, data_specialist, comparative_analyst, news_researcher",
+            original_query,
+            early_results.len(),
+            early_findings
+        );
+
+        let base_url = std::env::var("OLLAMA_HOST")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+
+        let mut refinement_client = OllamaClient::with_config(base_url, research_model.to_string());
+        refinement_client.set_max_tool_turns(max_tool_turns);
+
+        let response = refinement_client.query_streaming(&prompt, |_| {}).await?;
+
+        // Parse JSON response - need to extract array ourselves since we don't have access to self
+        let cleaned = if let Some(start) = response.find('[') {
+            if let Some(end) = response.rfind(']') {
+                response[start..=end].to_string()
+            } else {
+                response.clone()
+            }
+        } else {
+            response.clone()
+        };
+
+        #[derive(Deserialize)]
+        struct QuestionAssignment {
+            question: String,
+            worker: String,
+        }
+
+        let assignments: Vec<QuestionAssignment> = serde_json::from_str(&cleaned)
+            .unwrap_or_else(|_| Vec::new()); // If parsing fails, return empty (graceful degradation)
+
+        let follow_ups: Vec<SubQuestion> = assignments.into_iter()
+            .map(|qa| SubQuestion {
+                question: qa.question,
+                assigned_worker: qa.worker,
+            })
+            .collect();
+
+        eprintln!("[Research] Generated {} follow-up questions based on early results", follow_ups.len());
+
+        Ok(follow_ups)
+    }
+
+    /// Execute workers with iterative refinement: start initial workers, then add follow-ups based on early results
+    async fn execute_workers_with_refinement(&self, initial_questions: &[SubQuestion], query: &str) -> Result<Vec<WorkerResult>> {
+        if initial_questions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Create channel for supervisor to request additional gap-filling workers
+        let (gap_tx, mut gap_rx) = mpsc::channel::<Vec<SubQuestion>>(1);
+
+        // Spawn supervisor task
+        let shared_memory = self.shared_memory.clone();
+        let ollama_config = self.ollama_config.clone();
+        let research_model = self.research_model.clone();
+        let max_tool_turns = self.max_tool_turns;
+        let query_owned = query.to_string();
+        let query_id = self.query_id.clone();
+        let min_worker_count = self.config.config.min_worker_count;
+        let max_worker_count = self.config.config.max_worker_count;
+        let initial_worker_count = initial_questions.len();
+
+        let supervisor_handle = if shared_memory.is_some() {
+            Some(tokio::spawn(async move {
+                Self::supervisor_loop(
+                    shared_memory.unwrap(),
+                    ollama_config,
+                    research_model,
+                    max_tool_turns,
+                    query_owned,
+                    query_id,
+                    gap_tx,
+                    min_worker_count,
+                    max_worker_count,
+                    initial_worker_count
+                ).await
+            }))
+        } else {
+            None
+        };
+
+        // Set up channel for worker results (with extra capacity for follow-ups)
+        let (tx, mut rx) = mpsc::channel(initial_questions.len() + 10);
+
+        // Launch initial workers
+        let mut handles = Vec::new();
+        for sub_q in initial_questions {
+            let tx = tx.clone();
+            let sub_q = sub_q.clone();
+            let worker = self.config.agents.workers
+                .iter()
+                .find(|w| w.name == sub_q.assigned_worker)
+                .cloned();
+
+            if worker.is_none() {
+                eprintln!("[Research] Warning: No worker found for {}", sub_q.assigned_worker);
+                continue;
+            }
+
+            let base_client = self.base_client.clone();
+            let tool_executor = self.tool_executor.clone();
+            let research_model = self.research_model.clone();
+            let max_tool_turns = self.max_tool_turns;
+            let progress_tx = self.progress_tx.clone();
+            let shared_memory = self.shared_memory.clone();
+
+            let handle = tokio::spawn(async move {
+                let result = Self::execute_worker(
+                    worker.unwrap(),
+                    &sub_q.question,
+                    base_client,
+                    tool_executor,
+                    research_model,
+                    max_tool_turns,
+                    progress_tx,
+                    shared_memory,
+                )
+                .await;
+
+                let worker_result = WorkerResult {
+                    question: sub_q.question.clone(),
+                    answer: result.unwrap_or_else(|e| format!("Error: {}", e)),
+                    worker_name: sub_q.assigned_worker.clone(),
+                };
+
+                let _ = tx.send(worker_result).await;
+            });
+
+            handles.push(handle);
+        }
+
+        // Don't drop tx yet - we may spawn gap-filling workers
+        // Keep track of active workers and gap-filling state
+        let mut active_workers = initial_questions.len();
+        let mut gap_workers_spawned = false;
+        let total_initial_workers = initial_questions.len();
+
+        // Collect results, triggering refinement after first 2-3 completions
+        let mut all_results = Vec::new();
+        let mut early_results_for_refinement = Vec::new();
+        let mut refinement_triggered = false;
+        let early_threshold = 2.min(initial_questions.len());
+
+        // Calculate midpoint for gap detection (halfway through initial workers)
+        let midpoint_threshold = (total_initial_workers + 1) / 2;
+
+        loop {
+            tokio::select! {
+                // Handle gap-filling worker requests from supervisor
+                Some(gap_questions) = gap_rx.recv() => {
+                    if !gap_workers_spawned {
+                        gap_workers_spawned = true;
+                        eprintln!("[Research] Supervisor requested {} gap-filling workers", gap_questions.len());
+
+                        for sub_q in gap_questions {
+                            let tx = tx.clone();
+                            let worker = self.config.agents.workers
+                                .iter()
+                                .find(|w| w.name == sub_q.assigned_worker)
+                                .cloned();
+
+                            if worker.is_none() {
+                                eprintln!("[Research] Warning: No worker found for {}", sub_q.assigned_worker);
+                                continue;
+                            }
+
+                            active_workers += 1;
+                            let base_client = self.base_client.clone();
+                            let tool_executor = self.tool_executor.clone();
+                            let research_model = self.research_model.clone();
+                            let max_tool_turns = self.max_tool_turns;
+                            let progress_tx = self.progress_tx.clone();
+                            let shared_memory = self.shared_memory.clone();
+
+                            let handle = tokio::spawn(async move {
+                                let result = Self::execute_worker(
+                                    worker.unwrap(),
+                                    &sub_q.question,
+                                    base_client,
+                                    tool_executor,
+                                    research_model,
+                                    max_tool_turns,
+                                    progress_tx,
+                                    shared_memory,
+                                )
+                                .await;
+
+                                let worker_result = WorkerResult {
+                                    question: sub_q.question.clone(),
+                                    answer: result.unwrap_or_else(|e| format!("Error: {}", e)),
+                                    worker_name: sub_q.assigned_worker.clone(),
+                                };
+
+                                let _ = tx.send(worker_result).await;
+                            });
+
+                            handles.push(handle);
+                        }
+                    }
+                }
+
+                // Handle worker results
+                Some(result) = rx.recv() => {
+            self.send_progress(ResearchProgress::WorkerCompleted(result.worker_name.clone()));
+            all_results.push(result.clone());
+
+            // Store completion progress for supervisor to track
+            if let Some(ref shared_memory) = self.shared_memory {
+                let progress_content = format!("Workers completed: {}/{}", all_results.len(), total_initial_workers);
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("completed_count".to_string(), all_results.len().to_string());
+                metadata.insert("total_initial_workers".to_string(), total_initial_workers.to_string());
+                metadata.insert("midpoint_threshold".to_string(), midpoint_threshold.to_string());
+                if let Some(ref qid) = self.query_id {
+                    metadata.insert("query_id".to_string(), qid.clone());
+                }
+                let _ = shared_memory.store_memory(
+                    crate::shared_memory::MemoryType::Context,
+                    progress_content,
+                    "executor".to_string(),
+                    Some(metadata)
+                ).await;
+            }
+
+            // Collect early results for refinement
+            if all_results.len() <= early_threshold && !refinement_triggered {
+                early_results_for_refinement.push(result);
+
+                // Trigger refinement after collecting enough early results
+                if early_results_for_refinement.len() == early_threshold {
+                    refinement_triggered = true;
+
+                    // Generate and launch follow-up questions in background
+                    let query_clone = query.to_string();
+                    let early_clone = early_results_for_refinement.clone();
+                    let config = self.config.clone();
+                    let base_client = self.base_client.clone();
+                    let tool_executor = self.tool_executor.clone();
+                    let research_model = self.research_model.clone();
+                    let max_tool_turns = self.max_tool_turns;
+                    let progress_tx = self.progress_tx.clone();
+                    let ollama_config = self.ollama_config.clone();
+                    let shared_memory = self.shared_memory.clone();
+
+                    tokio::spawn(async move {
+                        // Generate follow-up questions
+                        let follow_ups = Self::generate_follow_up_questions_static(
+                            &query_clone,
+                            &early_clone,
+                            &research_model,
+                            max_tool_turns,
+                            &ollama_config
+                        ).await;
+
+                        if let Ok(follow_ups) = follow_ups {
+                            if !follow_ups.is_empty() {
+                                eprintln!("[Research] Launching {} follow-up workers...", follow_ups.len());
+                                // Launch follow-up workers
+                                for follow_up in follow_ups {
+                                    let worker = config.agents.workers
+                                        .iter()
+                                        .find(|w| w.name == follow_up.assigned_worker)
+                                        .cloned();
+
+                                    if let Some(worker) = worker {
+                                        let base_client = base_client.clone();
+                                        let tool_executor = tool_executor.clone();
+                                        let research_model = research_model.clone();
+                                        let progress_tx = progress_tx.clone();
+                                        let shared_memory = shared_memory.clone();
+
+                                        tokio::spawn(async move {
+                                            let _ = Self::execute_worker(
+                                                worker,
+                                                &follow_up.question,
+                                                base_client,
+                                                tool_executor,
+                                                research_model,
+                                                max_tool_turns,
+                                                progress_tx,
+                                                shared_memory,
+                                            ).await;
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
+                    // Check if all workers have completed
+                    active_workers -= 1;
+                    if active_workers == 0 {
+                        break;
+                    }
+                }
+
+                else => break,
+            }
+        }
+
+        // Wait for initial worker handles to complete
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        // Stop supervisor
+        if let Some(handle) = supervisor_handle {
+            handle.abort();
+        }
+
+        Ok(all_results)
+    }
+
+    /// Execute workers with active supervision from lead researcher
+    #[allow(dead_code)]
+    async fn execute_workers_with_supervision(&self, sub_questions: &[SubQuestion], query: &str) -> Result<Vec<WorkerResult>> {
+        // Create dummy gap worker channel (not used in this mode)
+        let (gap_tx, _gap_rx) = mpsc::channel::<Vec<SubQuestion>>(1);
+
+        // Spawn supervisor task
+        let shared_memory = self.shared_memory.clone();
+        let ollama_config = self.ollama_config.clone();
+        let research_model = self.research_model.clone();
+        let max_tool_turns = self.max_tool_turns;
+        let query_owned = query.to_string();
+        let query_id = self.query_id.clone();
+        let min_worker_count = self.config.config.min_worker_count;
+        let max_worker_count = self.config.config.max_worker_count;
+        let initial_worker_count = sub_questions.len();
+
+        let supervisor_handle = if shared_memory.is_some() {
+            Some(tokio::spawn(async move {
+                Self::supervisor_loop(
+                    shared_memory.unwrap(),
+                    ollama_config,
+                    research_model,
+                    max_tool_turns,
+                    query_owned,
+                    query_id,
+                    gap_tx,
+                    min_worker_count,
+                    max_worker_count,
+                    initial_worker_count
+                ).await
+            }))
+        } else {
+            None
+        };
+
+        // Execute workers as normal
+        let results = self.execute_workers(sub_questions).await?;
+
+        // Stop supervisor
+        if let Some(handle) = supervisor_handle {
+            handle.abort();
+        }
+
+        Ok(results)
+    }
+
+    /// Supervisor loop - monitors memory and provides guidance
+    /// Can spawn 1-3 gap-filling workers once during research if gaps detected
+    async fn supervisor_loop(
+        shared_memory: Arc<crate::shared_memory::SharedMemory>,
+        ollama_config: crate::config::OllamaConfig,
+        research_model: String,
+        max_tool_turns: usize,
+        query: String,
+        query_id: Option<String>,
+        gap_worker_tx: mpsc::Sender<Vec<SubQuestion>>,
+        _min_worker_count: usize,
+        max_worker_count: usize,
+        initial_worker_count: usize,
+    ) {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+        let mut iteration = 0;
+        let mut gap_workers_requested = false;
+
+        loop {
+            interval.tick().await;
+            iteration += 1;
+
+            // Get MOST RECENT memories (not just similar) - workers may be producing new findings
+            // get_by_type returns memories ordered by creation time
+            let mut discoveries = shared_memory.get_by_type(crate::shared_memory::MemoryType::Discovery).await;
+            let mut insights = shared_memory.get_by_type(crate::shared_memory::MemoryType::Insight).await;
+            let deadends = shared_memory.get_by_type(crate::shared_memory::MemoryType::Deadend).await;
+            let plans = shared_memory.get_by_type(crate::shared_memory::MemoryType::Plan).await;
+            let progress_contexts = shared_memory.get_by_type(crate::shared_memory::MemoryType::Context).await;
+
+            // Check worker completion progress for gap detection trigger
+            let (completed_count, midpoint_threshold) = if let Some(latest_progress) = progress_contexts.last() {
+                let completed = latest_progress.metadata.get("completed_count")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let midpoint = latest_progress.metadata.get("midpoint_threshold")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or((initial_worker_count + 1) / 2);
+                (completed, midpoint)
+            } else {
+                (0, (initial_worker_count + 1) / 2)
+            };
+
+            // Reverse to get newest first
+            discoveries.reverse();
+            insights.reverse();
+
+            // Take most recent discoveries and insights (limit to avoid token overflow)
+            let discoveries: Vec<_> = discoveries.into_iter().take(20).collect();
+            let insights: Vec<_> = insights.into_iter().take(10).collect();
+
+            // Skip first iteration if nothing to review yet
+            if discoveries.is_empty() && insights.is_empty() && iteration == 1 {
+                eprintln!("[Supervisor] Iteration {}: No discoveries/insights yet, skipping", iteration);
+                continue;
+            }
+
+            // After first iteration, always provide feedback even if workers haven't produced much
+            // This helps guide workers who may be stuck or off-track
+
+            eprintln!("[Supervisor] Iteration {}: Reviewing {} discoveries, {} insights, {} deadends",
+                iteration, discoveries.len(), insights.len(), deadends.len());
+
+            // Get the plan
+            let plan_content = plans.first().map(|p| p.content.as_str()).unwrap_or("No plan found");
+
+            // Create summary of current state
+            let discoveries_summary = discoveries.iter()
+                .map(|d| format!("- {} (by {})", d.content.chars().take(200).collect::<String>(), d.created_by))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let insights_summary = insights.iter()
+                .map(|i| format!("- {} (by {})", i.content.chars().take(200).collect::<String>(), i.created_by))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // Analyze and provide feedback
+            let analysis_prompt = format!(
+                "You are monitoring a multi-agent research session.\n\n\
+                ORIGINAL QUERY: {}\n\n\
+                RESEARCH PLAN:\n{}\n\n\
+                CURRENT DISCOVERIES ({}):\n{}\n\n\
+                CURRENT INSIGHTS ({}):\n{}\n\n\
+                Your task:\n\
+                1. Are agents staying focused on the query and plan?\n\
+                2. Are there discoveries/insights that are off-topic or misleading?\n\
+                3. What additional context or guidance should be provided?\n\n\
+                Provide brief analysis (2-3 sentences) and any recommended guidance to store in feedback memory.",
+                query,
+                plan_content,
+                discoveries.len(),
+                if discoveries_summary.is_empty() { "(none yet)" } else { &discoveries_summary },
+                insights.len(),
+                if insights_summary.is_empty() { "(none yet)" } else { &insights_summary }
+            );
+
+            // Query supervisor LLM
+            let base_url = std::env::var("OLLAMA_HOST")
+                .unwrap_or_else(|_| ollama_config.host.clone());
+
+            let mut supervisor_client = OllamaClient::with_config(base_url, research_model.clone());
+            supervisor_client.set_max_tool_turns(max_tool_turns);
+
+            match supervisor_client.query_streaming(&analysis_prompt, |_| {}).await {
+                Ok(analysis) => {
+                    eprintln!("[Supervisor] Analysis: {}", analysis.chars().take(150).collect::<String>());
+
+                    // Store feedback in memory
+                    let mut metadata = std::collections::HashMap::new();
+                    metadata.insert("iteration".to_string(), iteration.to_string());
+                    // Add query_id for session tracking
+                    if let Some(ref qid) = query_id {
+                        metadata.insert("query_id".to_string(), qid.clone());
+                    }
+
+                    // Update existing feedback rather than creating new row
+                    // This keeps only the latest supervisor feedback, reducing memory noise
+                    if let Err(e) = shared_memory.update_or_store_memory(
+                        crate::shared_memory::MemoryType::Feedback,
+                        analysis.clone(),
+                        "supervisor".to_string(),
+                        Some(metadata)
+                    ).await {
+                        eprintln!("[Supervisor] Failed to update feedback: {}", e);
+                    }
+
+                    // GAP DETECTION: When halfway through workers complete, check for gaps and spawn workers once
+                    if !gap_workers_requested && completed_count >= midpoint_threshold && completed_count > 0 && initial_worker_count < max_worker_count {
+                        eprintln!("[Supervisor] Midpoint reached ({}/{} workers completed), checking for research gaps...", completed_count, initial_worker_count);
+                        gap_workers_requested = true;
+
+                        let gap_detection_prompt = format!(
+                            "You are supervising a multi-agent research session.\n\n\
+                            ORIGINAL QUERY: {}\n\n\
+                            RESEARCH PLAN:\n{}\n\n\
+                            CURRENT DISCOVERIES ({}):\n{}\n\n\
+                            CURRENT INSIGHTS ({}):\n{}\n\n\
+                            WORKERS DEPLOYED: {} out of max {}\n\n\
+                            Your task: Identify CRITICAL GAPS in the research coverage.\n\
+                            - What key aspects of the query are NOT being researched?\n\
+                            - What important angles/perspectives are missing?\n\
+                            - What questions should have been asked but weren't?\n\n\
+                            If you identify gaps, create 1-3 focused sub-questions to fill them.\n\
+                            These will spawn additional workers (you can add up to {} more workers).\n\n\
+                            Respond with EITHER:\n\
+                            1. 'NO_GAPS' if research coverage is adequate\n\
+                            2. A JSON array of gap-filling questions:\n\
+                            [{{\"question\": \"...\", \"worker\": \"web_researcher|technical_analyst|data_specialist|comparative_analyst|news_researcher\"}}]\n\n\
+                            Available workers:\n\
+                            - web_researcher: General web research, organizational info, established facts\n\
+                            - technical_analyst: Technical specifications, APIs, implementation details\n\
+                            - data_specialist: Quantitative metrics, statistics, numerical data\n\
+                            - comparative_analyst: Side-by-side comparisons, trade-off analysis\n\
+                            - news_researcher: Recent developments, breaking news, updates\n\n\
+                            CRITICAL: Return ONLY 'NO_GAPS' or valid JSON array. No markdown, no explanation.",
+                            query,
+                            plan_content,
+                            discoveries.len(),
+                            if discoveries_summary.is_empty() { "(none yet)" } else { &discoveries_summary },
+                            insights.len(),
+                            if insights_summary.is_empty() { "(none yet)" } else { &insights_summary },
+                            initial_worker_count,
+                            max_worker_count,
+                            (max_worker_count - initial_worker_count).min(3)
+                        );
+
+                        match supervisor_client.query_streaming(&gap_detection_prompt, |_| {}).await {
+                            Ok(gap_response) => {
+                                let trimmed = gap_response.trim();
+                                if trimmed != "NO_GAPS" && !trimmed.is_empty() {
+                                    // Try to parse as JSON array
+                                    if let Ok(cleaned) = Self::extract_json_array_static(&gap_response) {
+                                        #[derive(serde::Deserialize)]
+                                        struct GapQuestion {
+                                            question: String,
+                                            worker: String,
+                                        }
+
+                                        if let Ok(gap_assignments) = serde_json::from_str::<Vec<GapQuestion>>(&cleaned) {
+                                            let gap_questions: Vec<SubQuestion> = gap_assignments.into_iter()
+                                                .take(3) // Limit to 3 gap-filling workers max
+                                                .take((max_worker_count - initial_worker_count).min(3))
+                                                .map(|g| SubQuestion {
+                                                    question: g.question,
+                                                    assigned_worker: g.worker,
+                                                })
+                                                .collect();
+
+                                            if !gap_questions.is_empty() {
+                                                eprintln!("[Supervisor] Detected research gaps, spawning {} additional workers", gap_questions.len());
+                                                let _ = gap_worker_tx.send(gap_questions).await;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("[Supervisor] No significant research gaps detected");
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("[Supervisor] Error in gap detection: {}", e);
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[Supervisor] Error analyzing memories: {}", e);
+                }
+            }
+        }
     }
 
     /// Execute worker agents in parallel using mpsc channels
+    #[allow(dead_code)]
     async fn execute_workers(&self, sub_questions: &[SubQuestion]) -> Result<Vec<WorkerResult>> {
         let (tx, mut rx) = mpsc::channel(sub_questions.len());
         let mut handles = Vec::new();
@@ -280,6 +1101,7 @@ impl ResearchOrchestrator {
             let progress_tx = self.progress_tx.clone();
             let research_model = self.research_model.clone();
             let max_tool_turns = self.max_tool_turns;
+            let shared_memory = self.shared_memory.clone();
 
             // Emit start event for this worker
             if let Some(p) = &progress_tx {
@@ -295,6 +1117,7 @@ impl ResearchOrchestrator {
                     research_model,
                     max_tool_turns,
                     progress_tx.clone(),
+                    shared_memory,
                 ).await;
 
                 let worker_result = match result {
@@ -338,6 +1161,113 @@ impl ResearchOrchestrator {
         Ok(results)
     }
 
+    /// Build pre-task memory context for agent
+    /// Follows LangGraph pattern: load relevant memories BEFORE agent starts reasoning
+    #[allow(dead_code)]
+    async fn build_memory_context(
+        tool_executor: &Option<Arc<Mutex<ToolExecutor>>>,
+        question: &str,
+    ) -> Result<String> {
+        if tool_executor.is_none() {
+            return Ok(String::new());
+        }
+
+        let executor = tool_executor.as_ref().unwrap();
+        let executor_lock = executor.lock().await;
+
+        let mut context_parts = Vec::new();
+        let empty_params = std::collections::HashMap::new();
+
+        // 1. Get research plan (always relevant)
+        if let Ok(plan_result) = executor_lock.execute_builtin_tool("memory_get_plan", empty_params.clone()).await {
+            if let Some(plan_text) = plan_result.get("plan").and_then(|v| v.as_str()) {
+                if plan_text != "No plan found" && !plan_text.is_empty() {
+                    context_parts.push(format!("📋 RESEARCH PLAN:\n{}", plan_text));
+                }
+            }
+        }
+
+        // 2. Get latest supervisor feedback
+        if let Ok(feedback_result) = executor_lock.execute_builtin_tool("memory_get_feedback", empty_params.clone()).await {
+            if let Some(feedback_arr) = feedback_result.get("feedback").and_then(|v| v.as_array()) {
+                if !feedback_arr.is_empty() {
+                    let feedback_items: Vec<String> = feedback_arr.iter()
+                        .filter_map(|f| {
+                            let content = f.get("content")?.as_str()?;
+                            let iteration = f.get("metadata")
+                                .and_then(|m| m.get("iteration"))
+                                .and_then(|i| i.as_str())
+                                .unwrap_or("?");
+                            Some(format!("  • [Iteration {}]: {}", iteration, content))
+                        })
+                        .collect();
+                    if !feedback_items.is_empty() {
+                        context_parts.push(format!("👁️ SUPERVISOR GUIDANCE:\n{}", feedback_items.join("\n")));
+                    }
+                }
+            }
+        }
+
+        // 3. Semantic search for relevant discoveries (top 5)
+        let mut search_params = std::collections::HashMap::new();
+        search_params.insert("query".to_string(), question.to_string());
+        search_params.insert("type".to_string(), "discovery".to_string());
+        search_params.insert("limit".to_string(), "5".to_string());
+
+        if let Ok(search_result) = executor_lock.execute_builtin_tool("memory_search", search_params).await {
+            if let Some(results_arr) = search_result.get("results").and_then(|v| v.as_array()) {
+                if !results_arr.is_empty() {
+                    let discovery_items: Vec<String> = results_arr.iter()
+                        .filter_map(|r| {
+                            let content = r.get("content")?.as_str()?;
+                            let created_by = r.get("created_by")?.as_str()?;
+                            Some(format!("  • [{}]: {}", created_by, content))
+                        })
+                        .collect();
+                    if !discovery_items.is_empty() {
+                        context_parts.push(format!("🔍 RELEVANT FINDINGS FROM OTHER AGENTS ({} discoveries):\n{}",
+                            discovery_items.len(), discovery_items.join("\n")));
+                    }
+                }
+            }
+        }
+
+        // 4. Get deadends to avoid (limit to recent 3)
+        if let Ok(deadend_result) = executor_lock.execute_builtin_tool("memory_get_deadends", empty_params).await {
+            if let Some(deadends_arr) = deadend_result.get("deadends").and_then(|v| v.as_array()) {
+                if !deadends_arr.is_empty() {
+                    let deadend_items: Vec<String> = deadends_arr.iter()
+                        .take(3)  // Limit to 3 most recent
+                        .filter_map(|d| {
+                            let content = d.get("content")?.as_str()?;
+                            let created_by = d.get("created_by")?.as_str()?;
+                            Some(format!("  • [{}]: {}", created_by, content))
+                        })
+                        .collect();
+                    if !deadend_items.is_empty() {
+                        context_parts.push(format!("⚠️ APPROACHES TO AVOID ({} deadends):\n{}",
+                            deadend_items.len(), deadend_items.join("\n")));
+                    }
+                }
+            }
+        }
+
+        drop(executor_lock);  // Release lock before formatting
+
+        if context_parts.is_empty() {
+            Ok(String::new())
+        } else {
+            Ok(format!(
+                "╔══════════════════════════════════════════════════════════════╗\n\
+                 ║  RELEVANT RESEARCH CONTEXT (from shared memory)              ║\n\
+                 ╚══════════════════════════════════════════════════════════════╝\n\n\
+                 {}\n\n\
+                 ═══════════════════════════════════════════════════════════════\n",
+                context_parts.join("\n\n")
+            ))
+        }
+    }
+
     /// Execute a single worker agent
     async fn execute_worker(
         worker: AgentRole,
@@ -347,6 +1277,7 @@ impl ResearchOrchestrator {
         research_model: String,
         max_tool_turns: usize,
         progress_tx: Option<mpsc::UnboundedSender<ResearchProgress>>,
+        shared_memory: Option<Arc<crate::shared_memory::SharedMemory>>,
     ) -> Result<String> {
         // Add small delay to avoid rate limiting
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -357,9 +1288,15 @@ impl ResearchOrchestrator {
         let mut worker_client = OllamaClient::with_config(base_url, research_model.clone());
         worker_client.set_max_tool_turns(max_tool_turns);
 
+        // Configure research mode summarization with higher threshold (10000 chars)
+        worker_client.set_summarization_config(None, 10000, true);
+
         // Set tool executor and available tools if available
-        if let Some(executor) = tool_executor {
-            worker_client.set_tool_executor(executor);
+        if let Some(ref executor) = tool_executor {
+            worker_client.set_tool_executor(executor.clone());
+
+            // Set agent name for tool call tracking
+            executor.lock().await.set_agent_name(worker.name.clone());
         }
         let available = worker.available_tools.clone();
         worker_client.set_available_tools(available.clone());
@@ -373,18 +1310,29 @@ impl ResearchOrchestrator {
             }
         }
 
-        let prompt = format!(
-            "CITATION REQUIREMENT: When citing sources, ALWAYS prefer full URLs when available. Use format [Source: https://full-url.com] instead of just site names. This enables independent verification.\n\n{}\n\nQuestion: {}",
-            worker.system_prompt,
-            question
-        );
-
-        // Emit a status before querying
+        // Build pre-task memory context (LangGraph pattern: load memories BEFORE agent starts)
         if let Some(p) = &progress_tx {
-            let _ = p.send(ResearchProgress::WorkerStatus { worker: worker.name.clone(), status: "Querying sources and aggregating findings...".to_string() });
+            let _ = p.send(ResearchProgress::WorkerStatus {
+                worker: worker.name.clone(),
+                status: "Loading relevant context from shared memory...".to_string()
+            });
         }
 
-        let answer = worker_client.query_streaming(&prompt, |_| {}).await?;
+        // Create per-worker dynamic context with access to shared memory
+        let dynamic_context = Arc::new(Mutex::new(crate::dynamic_context::DynamicContext::new(
+            question.to_string(),
+            worker.system_prompt.clone(),
+            shared_memory,
+        )));
+
+        // Execute worker with dynamic context that updates each iteration
+        let answer = Self::execute_worker_with_dynamic_context(
+            &worker,
+            question,
+            &mut worker_client,
+            dynamic_context,
+            progress_tx.clone(),
+        ).await?;
 
         // Emit a status after response
         if let Some(p) = &progress_tx {
@@ -393,26 +1341,62 @@ impl ResearchOrchestrator {
         Ok(answer)
     }
 
+    /// Execute worker with dynamic context that syncs with shared memory before starting
+    async fn execute_worker_with_dynamic_context(
+        worker: &AgentRole,
+        question: &str,
+        worker_client: &mut OllamaClient,
+        dynamic_context: Arc<Mutex<crate::dynamic_context::DynamicContext>>,
+        progress_tx: Option<mpsc::UnboundedSender<ResearchProgress>>,
+    ) -> Result<String> {
+        // Build context with latest plan, feedback, and relevant findings from shared memory
+        let context_section = {
+            let mut ctx = dynamic_context.lock().await;
+            ctx.build_prompt_context().await.unwrap_or_default()
+        };
+
+        let prompt = format!(
+            "{}\n\n\
+            CITATION REQUIREMENT: When citing sources, ALWAYS prefer full URLs when available. Use format [Source: https://full-url.com] instead of just site names. This enables independent verification.\n\n\
+            {}\n\n\
+            Question: {}",
+            context_section,
+            worker.system_prompt,
+            question
+        );
+
+        // Status update
+        if let Some(ref p) = progress_tx {
+            let _ = p.send(ResearchProgress::WorkerStatus {
+                worker: worker.name.clone(),
+                status: "Executing with latest plan and feedback...".to_string()
+            });
+        }
+
+        // query_streaming handles tool iterations internally with its own context
+        let answer = worker_client.query_streaming(&prompt, |_| {}).await?;
+
+        Ok(answer)
+    }
+
     /// Summarize a long worker result to reduce token count
-    async fn summarize_worker_result(&self, result: &WorkerResult, num_workers: usize) -> Result<String> {
-        // Calculate available tokens per worker based on context window
+    async fn summarize_worker_result(&self, result: &WorkerResult, _num_workers: usize) -> Result<String> {
+        // Each agent has their own complete context, so we don't need to split
+        // the context window. Only summarize if result is extremely long.
         // Reserve 20% for prompts, system messages, and overhead
         let available_tokens = (self.context_window as f64 * 0.8) as usize;
+        let max_chars = available_tokens * 4; // 4 chars ≈ 1 token
 
-        // Divide available tokens among all workers
-        // Use 4 chars ≈ 1 token as rough estimate
-        let max_chars_per_worker = (available_tokens / num_workers) * 4;
+        eprintln!("[Research] Context window: {}, Max chars per result: ~{}",
+                  self.context_window, max_chars);
 
-        eprintln!("[Research] Context window: {}, Available per worker: ~{} chars ({} workers)",
-                  self.context_window, max_chars_per_worker, num_workers);
-
-        // If result is within allocation, return as-is
-        if result.answer.len() <= max_chars_per_worker {
+        // If result is within limit, return as-is
+        if result.answer.len() <= max_chars {
             return Ok(result.answer.clone());
         }
 
         eprintln!("[Research] Worker result too long ({} chars), summarizing to fit ~{} chars...",
-                  result.answer.len(), max_chars_per_worker);
+                  result.answer.len(), max_chars);
 
         // Add delay to avoid rate limiting
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -442,7 +1426,7 @@ impl ResearchOrchestrator {
             Err(e) => {
                 eprintln!("[Research] Summarization failed: {}, using truncated version", e);
                 // Fallback to truncation if summarization fails
-                let truncate_len = max_chars_per_worker.min(result.answer.len());
+                let truncate_len = max_chars.min(result.answer.len());
                 Ok(format!("{}...\n\n[Note: Content truncated due to length]", &result.answer[..truncate_len]))
             }
         }
@@ -580,7 +1564,7 @@ impl ResearchOrchestrator {
     /// Refinement loop with multi-agent debate
     async fn refinement_loop(&self, initial_output: &str) -> Result<String> {
         let mut current_output = initial_output.to_string();
-        let max_iterations = self.config.config.max_refinement_iterations;
+        let max_iterations = self.ollama_config.max_refinement_iterations;
 
         for iteration in 0..max_iterations {
             // Multi-agent debate
@@ -639,7 +1623,7 @@ impl ResearchOrchestrator {
         let base_url = std::env::var("OLLAMA_HOST")
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
-        let max_rounds = self.config.config.max_debate_rounds;
+        let max_rounds = self.ollama_config.max_debate_rounds;
         let mut debate_history = String::new();
         let mut last_advocate_arg;
         let mut last_skeptic_arg = String::new();
@@ -786,7 +1770,7 @@ impl ResearchOrchestrator {
     /// Document writing loop with document critic
     async fn document_writing_loop(&self, original_query: &str, research_content: &str) -> Result<String> {
         let mut current_document = String::new();
-        let max_iterations = self.config.config.max_document_iterations;
+        let max_iterations = self.ollama_config.max_document_iterations;
 
         for iteration in 0..max_iterations {
             // Write or rewrite the document
@@ -929,6 +1913,10 @@ impl ResearchOrchestrator {
 
     /// Extract JSON array from response text
     fn extract_json_array(&self, text: &str) -> Result<String> {
+        Self::extract_json_array_static(text)
+    }
+
+    fn extract_json_array_static(text: &str) -> Result<String> {
         // Try to find JSON array in the response
         if let Some(start) = text.find('[') {
             if let Some(end) = text.rfind(']') {

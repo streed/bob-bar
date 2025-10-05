@@ -7,6 +7,9 @@ mod ollama;
 mod tools;
 mod screenshot;
 mod research;
+mod embeddings;
+mod shared_memory;
+mod dynamic_context;
 
 use iced::{
     widget::{column, row, container, scrollable, text, text_input, button, text_input::Id, rich_text, span, text_editor, Space},
@@ -594,6 +597,7 @@ enum Message {
     ToggleSelectMode,
     OutputEditorAction(text_editor::Action),
     ToggleResearchMode,
+    #[allow(dead_code)]
     ResearchProgress(research::ResearchProgress),
 }
 
@@ -678,12 +682,20 @@ impl App {
             None
         };
 
+        // Clone ollama config early for research orchestrator
+        let ollama_config = config.ollama.clone();
+
         // Create Ollama client
         let mut ollama_client = ollama::OllamaClient::with_config(
             config.ollama.host,
             config.ollama.model.clone(),
         );
         ollama_client.set_max_tool_turns(config.ollama.max_tool_turns);
+        ollama_client.set_summarization_config(
+            config.ollama.summarization_model.clone(),
+            config.ollama.summarization_threshold,
+            false // Not research mode for main client
+        );
 
         let tool_executor_clone = if let Some(ref executor) = tool_executor {
             ollama_client.set_tool_executor(executor.clone());
@@ -706,6 +718,7 @@ impl App {
         let research_orchestrator = if agents_path.exists() {
             match research::ResearchOrchestrator::from_file(
                 &agents_path,
+                ollama_config,
                 ollama_client_arc.clone(),
                 config.ollama.context_window,
                 research_model.clone(),
@@ -723,9 +736,9 @@ impl App {
                         eprintln!("Research orchestrator initialized from: {}", agents_path.display());
                         eprintln!("Research model: {}", research_model);
                         eprintln!("Context window: {} tokens", config.ollama.context_window);
-                        eprintln!("Max refinement iterations: {}", config.research.max_refinement_iterations);
-                        eprintln!("Max debate rounds: {}", config.research.max_debate_rounds);
-                        eprintln!("Worker count: {}", config.research.worker_count);
+                        eprintln!("Max refinement iterations: {}", config.ollama.max_refinement_iterations);
+                        eprintln!("Max debate rounds: {}", config.ollama.max_debate_rounds);
+                        eprintln!("Worker count range: {}-{}", config.research.min_worker_count, config.research.max_worker_count);
                         eprintln!("=====================\n");
                     }
                     Some(Arc::new(Mutex::new(orchestrator)))

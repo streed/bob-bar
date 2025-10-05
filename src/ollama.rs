@@ -128,6 +128,9 @@ pub struct OllamaClient {
     tool_executor: Option<Arc<Mutex<ToolExecutor>>>,
     available_tools: Option<Vec<String>>, // Filter to only these tools if specified
     max_tool_turns: usize,
+    summarization_model: Option<String>,
+    summarization_threshold: usize,
+    is_research_mode: bool,  // Whether this client is used for research (higher thresholds)
 }
 
 impl OllamaClient {
@@ -140,7 +143,17 @@ impl OllamaClient {
             .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        OllamaClient { base_url, model, client, tool_executor: None, available_tools: None, max_tool_turns: 5 }
+        OllamaClient {
+            base_url,
+            model,
+            client,
+            tool_executor: None,
+            available_tools: None,
+            max_tool_turns: 5,
+            summarization_model: None,
+            summarization_threshold: 5000,
+            is_research_mode: false,
+        }
     }
 
     pub fn with_config(base_url: String, model: String) -> Self {
@@ -148,7 +161,17 @@ impl OllamaClient {
             .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        OllamaClient { base_url, model, client, tool_executor: None, available_tools: None, max_tool_turns: 5 }
+        OllamaClient {
+            base_url,
+            model,
+            client,
+            tool_executor: None,
+            available_tools: None,
+            max_tool_turns: 5,
+            summarization_model: None,
+            summarization_threshold: 5000,
+            is_research_mode: false,
+        }
     }
 
     pub fn set_max_tool_turns(&mut self, max_turns: usize) {
@@ -161,6 +184,12 @@ impl OllamaClient {
 
     pub fn set_available_tools(&mut self, tools: Vec<String>) {
         self.available_tools = Some(tools);
+    }
+
+    pub fn set_summarization_config(&mut self, model: Option<String>, threshold: usize, is_research: bool) {
+        self.summarization_model = model;
+        self.summarization_threshold = threshold;
+        self.is_research_mode = is_research;
     }
 
     pub fn get_model(&self) -> &str {
@@ -260,7 +289,9 @@ Multiple tools (will be executed in parallel):
 ]
 
 Available tools:\n{}\n\n{}\n\nRemember:
-- You can call multiple tools in one response by using an array
+- **IMPORTANT: Call ALL needed tools at once in a single array when possible** - Don't make users wait for sequential tool calls
+- Use multiple tools when: gathering different types of info, checking multiple sources, or performing parallel lookups
+- Example: If researching a topic, call web_search AND read relevant files in the same response
 - If tools are needed, respond with ONLY the JSON (no markdown, no formatting)
 - If no tools are needed, format your response in clean markdown (use headers, lists, code blocks, etc. as appropriate)
 
@@ -532,30 +563,162 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
         }
     }
 
+    /// Extract critical research fields from JSON that should always be preserved
+    fn extract_critical_fields(json_value: &Value) -> Vec<(String, String)> {
+        let mut critical = Vec::new();
+
+        fn extract_recursive(value: &Value, path: String, critical: &mut Vec<(String, String)>) {
+            match value {
+                Value::Object(map) => {
+                    for (key, val) in map {
+                        let key_lower = key.to_lowercase();
+                        let new_path = if path.is_empty() { key.clone() } else { format!("{}.{}", path, key) };
+
+                        // Check if this is a critical field
+                        let is_critical = key_lower.contains("url") || key_lower.contains("doi") ||
+                                        key_lower.contains("author") || key_lower.contains("title") ||
+                                        key_lower.contains("date") || key_lower.contains("citation") ||
+                                        key_lower.contains("link") || key_lower.contains("href") ||
+                                        key_lower.contains("source") || key_lower.contains("reference");
+
+                        if is_critical {
+                            if let Some(s) = val.as_str() {
+                                critical.push((new_path.clone(), s.to_string()));
+                            } else if !val.is_null() {
+                                critical.push((new_path.clone(), val.to_string()));
+                            }
+                        }
+
+                        extract_recursive(val, new_path, critical);
+                    }
+                },
+                Value::Array(arr) => {
+                    for (i, val) in arr.iter().enumerate() {
+                        let new_path = format!("{}[{}]", path, i);
+                        extract_recursive(val, new_path, critical);
+                    }
+                },
+                _ => {}
+            }
+        }
+
+        extract_recursive(json_value, String::new(), &mut critical);
+        critical
+    }
+
+    /// Smart structural summarization for JSON data
+    fn smart_summarize_json(json_value: &Value, max_chars: usize) -> Option<Value> {
+        match json_value {
+            Value::Array(arr) if arr.len() > 10 => {
+                // For large arrays, sample first 5 + last 2 items
+                let mut sampled = Vec::new();
+                sampled.extend_from_slice(&arr[..5.min(arr.len())]);
+                if arr.len() > 7 {
+                    sampled.push(serde_json::json!({
+                        "_note": format!("... {} items omitted ...", arr.len() - 7)
+                    }));
+                    sampled.extend_from_slice(&arr[arr.len()-2..]);
+                }
+                Some(Value::Array(sampled))
+            },
+            Value::Object(map) if serde_json::to_string(json_value).ok()?.len() > max_chars => {
+                // For large objects, preserve critical fields and summarize others
+                let mut result = serde_json::Map::new();
+                let mut char_count = 0;
+                let mut fields_included = 0;
+                let total_fields = map.len();
+
+                for (key, value) in map {
+                    let key_lower = key.to_lowercase();
+                    let is_critical = key_lower.contains("url") || key_lower.contains("doi") ||
+                                    key_lower.contains("author") || key_lower.contains("title") ||
+                                    key_lower.contains("date") || key_lower.contains("citation");
+
+                    if is_critical || char_count < max_chars / 2 {
+                        result.insert(key.clone(), value.clone());
+                        char_count += serde_json::to_string(value).ok()?.len();
+                        fields_included += 1;
+                    }
+                }
+
+                if fields_included < total_fields {
+                    result.insert(
+                        "_summary".to_string(),
+                        Value::String(format!("{} of {} fields shown (critical fields preserved)", fields_included, total_fields))
+                    );
+                }
+
+                Some(Value::Object(result))
+            },
+            _ => None
+        }
+    }
+
     /// Summarize a long tool result to reduce token usage (non-recursive version)
     async fn summarize_tool_result(&self, tool_name: &str, result: &str) -> Result<String> {
-        const MAX_LENGTH: usize = 2000; // Characters threshold for summarization - increased to preserve more detail
+        // Use configured threshold (higher for research mode)
+        let max_length = self.summarization_threshold;
 
         // If result is short enough, return as-is
-        if result.len() <= MAX_LENGTH {
+        if result.len() <= max_length {
             return Ok(result.to_string());
         }
 
-        debug_eprintln!("[Tool] Result from '{}' is {} chars, summarizing...", tool_name, result.len());
+        debug_eprintln!("[Tool] Result from '{}' is {} chars, summarizing (threshold: {})...", tool_name, result.len(), max_length);
+
+        // Try structural summarization first for JSON
+        if let Ok(json_value) = serde_json::from_str::<Value>(result) {
+            debug_eprintln!("[Tool] Attempting structural summarization for JSON...");
+
+            // Extract critical fields first
+            let critical_fields = Self::extract_critical_fields(&json_value);
+
+            // Try smart JSON summarization
+            if let Some(summarized_json) = Self::smart_summarize_json(&json_value, max_length) {
+                let summarized_str = serde_json::to_string_pretty(&summarized_json)
+                    .unwrap_or_else(|_| result.to_string());
+
+                if summarized_str.len() <= max_length * 2 {
+                    debug_eprintln!("[Tool] Structural summarization successful: {} -> {} chars", result.len(), summarized_str.len());
+
+                    // Append critical fields as a note if any were extracted
+                    if !critical_fields.is_empty() && summarized_str.len() < max_length {
+                        let critical_note = format!(
+                            "\n\n# Critical Research Data Preserved:\n{}",
+                            critical_fields.iter()
+                                .take(20) // Limit to first 20 critical fields
+                                .map(|(k, v)| format!("- {}: {}", k, v))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        );
+                        return Ok(format!("{}{}", summarized_str, critical_note));
+                    }
+
+                    return Ok(summarized_str);
+                }
+            }
+        }
+
+        // Fall back to LLM summarization
+        debug_eprintln!("[Tool] Using LLM summarization...");
 
         let prompt = format!(
             "Condense this tool result while keeping all important information:\n\n\
-            - Preserve ALL key facts, data, and specific details\n\
-            - Keep technical information and numbers\n\
+            - Preserve ALL URLs, DOIs, citations, author names, and dates\n\
+            - Keep all key facts, data, and specific details\n\
+            - Preserve technical information and numbers\n\
             - Maintain structure and context\n\
             - Remove only truly redundant content\n\n\
             Tool result:\n{}",
             result
         );
 
+        // Use summarization model if configured, otherwise use main model
+        let model_to_use = self.summarization_model.as_ref().unwrap_or(&self.model).clone();
+
         // Make a direct API call without going through query_internal to avoid recursion
         let request = OllamaChatRequest {
-            model: self.model.clone(),
+            model: model_to_use.clone(),
             messages: vec![Message {
                 role: "user".to_string(),
                 content: prompt,
@@ -577,18 +740,19 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
                 match resp.json::<OllamaChatResponse>().await {
                     Ok(ollama_response) => {
                         let summary = ollama_response.message.content;
-                        debug_eprintln!("[Tool] Summarized '{}' from {} to {} chars", tool_name, result.len(), summary.len());
+                        debug_eprintln!("[Tool] LLM summarized '{}' using {} from {} to {} chars",
+                            tool_name, model_to_use, result.len(), summary.len());
                         Ok(summary)
                     },
                     Err(e) => {
                         debug_eprintln!("[Tool] Failed to parse summarization response: {}", e);
-                        Ok(format!("{}...\n\n[Note: Content truncated due to length]", &result[..MAX_LENGTH]))
+                        Ok(format!("{}...\n\n[Note: Content truncated due to length]", &result[..max_length]))
                     }
                 }
             },
             _ => {
                 debug_eprintln!("[Tool] Summarization request failed, using truncated version");
-                Ok(format!("{}...\n\n[Note: Content truncated due to length]", &result[..MAX_LENGTH]))
+                Ok(format!("{}...\n\n[Note: Content truncated due to length]", &result[..max_length]))
             }
         }
     }
@@ -608,18 +772,19 @@ Format your response in clean markdown (use headers, lists, code blocks, etc. as
         let parameters = tool_call.get("parameters")
             .ok_or_else(|| anyhow::anyhow!("Missing parameters"))?;
 
-        // If tool_type is not one of the standard categories, look up the tool by name to find its real type
-        let actual_tool_type: String = if matches!(tool_type, "builtin" | "http" | "mcp") {
-            tool_type.to_string()
-        } else {
-            // Look up the tool in the executor to find its real type
+        // Always look up the tool by name to verify/correct the type
+        // LLM sometimes returns wrong tool_type (e.g., "builtin" for HTTP tools)
+        let actual_tool_type: String = {
             let exec = executor.lock().await;
             let tool_descriptions = exec.get_tool_descriptions();
 
             if let Some(tool_desc) = tool_descriptions.iter().find(|t| t.name == tool_name) {
-                debug_eprintln!("[Tool] Resolved '{}': {} -> {}", tool_name, tool_type, tool_desc.tool_type);
+                if tool_desc.tool_type != tool_type {
+                    debug_eprintln!("[Tool] Corrected type for '{}': {} -> {}", tool_name, tool_type, tool_desc.tool_type);
+                }
                 tool_desc.tool_type.clone()
             } else {
+                debug_eprintln!("[Tool] Warning: Tool '{}' not found in descriptions, using LLM-provided type '{}'", tool_name, tool_type);
                 tool_type.to_string()
             }
         };

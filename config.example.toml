@@ -21,6 +21,17 @@ vision_model = "llama3.2-vision:11b"
 # Default: uses main model
 # research_model = "llama2:70b"
 
+# Embedding model for vector similarity search
+# Used for query deduplication and shared memory in research mode
+# Default: nomic-embed-text
+embedding_model = "nomic-embed-text"
+
+# Embedding vector dimensions
+# Must match the output dimensions of the embedding model
+# nomic-embed-text outputs 768-dimensional vectors
+# Default: 768
+embedding_dimensions = 768
+
 # Context window size (in tokens) for the model
 # This determines how much information can be processed at once
 # Common values:
@@ -36,8 +47,6 @@ context_window = 128000
 # Default: 5
 max_tool_turns = 5
 
-# Research mode configuration
-[research]
 # Maximum number of refinement iterations in the critic-refiner loop
 # The critic evaluates output quality and the refiner improves it
 # Loop stops when critic approves OR max iterations reached
@@ -51,13 +60,15 @@ max_refinement_iterations = 5
 # Default: 3
 max_document_iterations = 3
 
-# Number of worker agents to spawn for parallel research
-# Workers research different sub-questions concurrently
-# Default: 3
-worker_count = 3
-
 # Maximum number of back-and-forth debate rounds
 # Each round: advocate rebuts → skeptic responds
 # After all rounds, synthesizer makes final decision
 # Default: 2
 max_debate_rounds = 2
+
+# Research mode configuration
+[research]
+# Number of worker agents to spawn for parallel research
+# Workers research different sub-questions concurrently
+# Default: 3
+worker_count = 3

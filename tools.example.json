@@ -1,6 +1,14 @@
 {
   "tools": {
-    "builtin": ["pdf_extract"],
+    "builtin": [
+      "pdf_extract",
+      "memory_store",
+      "memory_search",
+      "memory_get_discoveries",
+      "memory_get_deadends",
+      "memory_get_insights",
+      "memory_stats"
+    ],
     "http": [
       {
         "name": "weather",

@@ -24,6 +24,7 @@ pub struct Entry {
 
 static VERBOSE_LOG: Lazy<Mutex<VecDeque<Entry>>> = Lazy::new(|| Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES)));
 
+#[allow(dead_code)]
 pub fn log<T: Into<String>>(line: T) {
     log_with(Kind::Info, line);
 }
