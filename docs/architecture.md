@@ -6,32 +6,32 @@ This document provides a high-level overview of bob-bar's architecture and how c
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Bob-Bar GUI                              │
-│                    (Iced Application)                            │
+│                         Bob-Bar GUI                             │
+│                    (Iced Application)                           │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Ollama Client                                 │
-│              (LLM Communication Layer)                           │
+│                    Ollama Client                                │
+│              (LLM Communication Layer)                          │
 └────────────┬───────────────────────────┬────────────────────────┘
              │                           │
              ▼                           ▼
 ┌────────────────────────┐   ┌──────────────────────────────────┐
 │   Research Engine      │   │     Tool Executor                │
 │  - Multi-Agent System  │   │  - Web Search                    │
-│  - Planning           │   │  - Wikipedia                     │
-│  - Worker Execution   │   │  - Semantic Scholar              │
-│  - Debate System      │   │  - arXiv Search                  │
-│  - Document Writing   │   │  - Weather API                   │
+│  - Planning            │   │  - Wikipedia                     │
+│  - Worker Execution    │   │  - Semantic Scholar              │
+│  - Debate System       │   │  - arXiv Search                  │
+│  - Document Writing    │   │  - Weather API                   │
 └────────┬───────────────┘   │  - News Search                   │
          │                   │  - Memory Tools                  │
          │                   └──────────┬───────────────────────┘
          │                              │
          ▼                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Shared Memory System                          │
-│                  (SQLite + Vector Search)                        │
+│                    Shared Memory System                         │
+│                  (SQLite + Vector Search)                       │
 │  - Discoveries      - Insights        - Deadends                │
 │  - Feedback         - Plans           - Context                 │
 │  - Query Results    - Tool Call Logs                            │
