@@ -13,11 +13,11 @@ This document provides a detailed walkthrough of bob-bar's multi-agent research 
 ┌─────────────────────────────────────────────────────────────┐
 │ Phase 1: PLANNING (Iterative with Plan Critic)              │
 ├─────────────────────────────────────────────────────────────┤
-│ 1. Clear previous memories from database                     │
+│ 1. Clear previous memories from database                    │
 │ 2. Lead coordinator decomposes query into sub-questions     │
 │ 3. Plan critic reviews for coverage, quality, assignments   │
 │ 4. If approved: proceed. If not: refine and review again    │
-│ 5. Repeat up to max_plan_iterations (default: 3)           │
+│ 5. Repeat up to max_plan_iterations (default: 3)            │
 └────────┬────────────────────────────────────────────────────┘
          │
          ▼
@@ -25,9 +25,9 @@ This document provides a detailed walkthrough of bob-bar's multi-agent research 
 │ Phase 2: EXECUTION (Parallel Workers + Supervisor)          │
 ├─────────────────────────────────────────────────────────────┤
 │ 1. Store approved plan in shared memory                     │
-│ 2. Spawn N workers in parallel (3-10 based on complexity)  │
+│ 2. Spawn N workers in parallel (3-10 based on complexity)   │
 │ 3. Spawn supervisor in parallel (monitors every 15s)        │
-│ 4. Workers execute with tools, store discoveries           │
+│ 4. Workers execute with tools, store discoveries            │
 │ 5. Supervisor provides feedback, identifies gaps            │
 │ 6. Collect results as workers complete                      │
 └────────┬────────────────────────────────────────────────────┘
@@ -40,7 +40,7 @@ This document provides a detailed walkthrough of bob-bar's multi-agent research 
 │ 2. Debate: Advocate argues strengths                        │
 │ 3. Debate: Skeptic challenges weaknesses                    │
 │ 4. Debate: Synthesizer makes final assessment               │
-│ 5. Repeat debate for max_debate_rounds (default: 2)        │
+│ 5. Repeat debate for max_debate_rounds (default: 2)         │
 └────────┬────────────────────────────────────────────────────┘
          │
          ▼
@@ -50,7 +50,7 @@ This document provides a detailed walkthrough of bob-bar's multi-agent research 
 │ 1. Refiner agent receives debate conclusions                │
 │ 2. Checks memory for existing answers first                 │
 │ 3. Fills gaps with additional research if needed            │
-│ 4. Iterates up to max_refinement_iterations (default: 5)   │
+│ 4. Iterates up to max_refinement_iterations (default: 5)    │
 └────────┬────────────────────────────────────────────────────┘
          │
          ▼
@@ -60,7 +60,7 @@ This document provides a detailed walkthrough of bob-bar's multi-agent research 
 │ 1. Writer synthesizes research into comprehensive document  │
 │ 2. Document critic reviews for depth, sources, clarity      │
 │ 3. If approved: proceed. If not: writer revises             │
-│ 4. Repeat up to max_document_iterations (default: 3)       │
+│ 4. Repeat up to max_document_iterations (default: 3)        │
 │ 5. Add references section with all source URLs              │
 └────────┬────────────────────────────────────────────────────┘
          │
