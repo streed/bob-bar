@@ -14,52 +14,52 @@ The memory system is built on SQLite with the vec0 extension for vector embeddin
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Agents                                   │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
-│  │ Worker 1 │  │ Worker 2 │  │Supervisor│  │ Refiner  │   │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘   │
+┌────────────────────────────────────────────────────────────┐
+│                     Agents                                 │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
+│  │ Worker 1 │  │ Worker 2 │  │Supervisor│  │ Refiner  │    │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘    │
 └───────┼─────────────┼─────────────┼─────────────┼──────────┘
         │             │             │             │
         ▼             ▼             ▼             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                Memory Tools (src/tools.rs)                   │
+│                Memory Tools (src/tools.rs)                  │
 │  memory_store()  memory_search()  memory_get_discoveries()  │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              SharedMemory (src/shared_memory.rs)             │
+│              SharedMemory (src/shared_memory.rs)            │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │  Public API                                           │  │
 │  │  - store_memory()                                     │  │
-│  │  - update_or_store_memory()                          │  │
+│  │  - update_or_store_memory()                           │  │
 │  │  - search_memories()                                  │  │
-│  │  - get_memories_by_type()                            │  │
+│  │  - get_memories_by_type()                             │  │
 │  │  - clear()                                            │  │
 │  └───────────────────────────────────────────────────────┘  │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    SQLite Database                           │
-│  ┌──────────────────────┐  ┌──────────────────────────┐    │
-│  │  memories            │  │  vec_memories (vec0)     │    │
-│  │  - id                │  │  - memory_id             │    │
-│  │  - query_id          │  │  - embedding[768]        │    │
-│  │  - memory_type       │  └──────────────────────────┘    │
-│  │  - content           │                                    │
-│  │  - created_by        │  ┌──────────────────────────┐    │
-│  │  - created_at        │  │  tool_calls              │    │
-│  │  - metadata (JSON)   │  │  - query_id              │    │
-│  └──────────────────────┘  │  - agent_name            │    │
-│                             │  - tool_name             │    │
-│                             │  - tool_type             │    │
-│                             │  - parameters            │    │
-│                             │  - result                │    │
-│                             │  - success               │    │
-│                             │  - timestamp             │    │
-│                             └──────────────────────────┘    │
+│                    SQLite Database                          │
+│  ┌──────────────────────┐  ┌──────────────────────────┐     │
+│  │  memories            │  │  vec_memories (vec0)     │     │
+│  │  - id                │  │  - memory_id             │     │
+│  │  - query_id          │  │  - embedding[768]        │     │
+│  │  - memory_type       │  └──────────────────────────┘     │
+│  │  - content           │                                   │
+│  │  - created_by        │  ┌──────────────────────────┐     │
+│  │  - created_at        │  │  tool_calls              │     │
+│  │  - metadata (JSON)   │  │  - query_id              │     │
+│  └──────────────────────┘  │  - agent_name            │     │
+│                            │  - tool_name             │     │
+│                            │  - tool_type             │     │
+│                            │  - parameters            │     │
+│                            │  - result                │     │
+│                            │  - success               │     │
+│                            │  - timestamp             │     │
+│                            └──────────────────────────┘     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
