@@ -494,6 +494,7 @@ dependencies = [
  "serde_json",
  "sqlite-vec",
  "tokio",
+ "tokio-util",
  "toml",
  "unicode-width 0.1.14",
 ]

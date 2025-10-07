@@ -307,11 +307,23 @@ impl SharedMemory {
                  LIMIT 1"
             )?;
 
-            stmt.query_row(
+            let result = stmt.query_row(
                 params![memory_type.as_str(), &created_by, qid],
                 |row| row.get(0)
-            ).ok()
+            ).ok();
+
+            if result.is_some() {
+                eprintln!("[Memory] Found existing {} from {} for query {}, will update",
+                    memory_type.as_str(), created_by, qid);
+            } else {
+                eprintln!("[Memory] No existing {} from {} for query {}, will create new",
+                    memory_type.as_str(), created_by, qid);
+            }
+
+            result
         } else {
+            eprintln!("[Memory] No query_id in metadata, will create new {} from {}",
+                memory_type.as_str(), created_by);
             None
         };
 

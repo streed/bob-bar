@@ -599,6 +599,7 @@ enum Message {
     ToggleResearchMode,
     #[allow(dead_code)]
     ResearchProgress(research::ResearchProgress),
+    CancelQuery,
 }
 
 struct App {
@@ -621,6 +622,7 @@ struct App {
     research_orchestrator: Option<Arc<Mutex<research::ResearchOrchestrator>>>,
     research_progress: Option<String>,
     research_start_time: Option<std::time::Instant>,
+    current_query_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl App {
@@ -776,6 +778,7 @@ impl App {
             research_orchestrator,
             research_progress: None,
             research_start_time: None,
+            current_query_cancel: None,
         };
 
         let focus_task = text_input::focus(input_id);
@@ -815,6 +818,10 @@ impl App {
                         *g = Some("Starting research...".to_string());
                     }
 
+                    // Create cancellation token for this query
+                    let cancel_token = tokio_util::sync::CancellationToken::new();
+                    self.current_query_cancel = Some(cancel_token.clone());
+
                     let query = self.input_text.clone();
                     let orchestrator = self.research_orchestrator.clone().unwrap();
 
@@ -828,19 +835,27 @@ impl App {
                         use research::ResearchProgress;
                         while let Some(progress) = progress_rx.recv().await {
                             let msg = match progress {
-                                ResearchProgress::Started => "Starting research...".to_string(),
-                                ResearchProgress::Decomposing => "Decomposing query into sub-questions...".to_string(),
-                                ResearchProgress::WorkersStarted(n) => format!("Dispatching {} research workers...", n),
-                                ResearchProgress::WorkerStarted { worker, question } => format!("{}: researching — {}", worker, question),
-                                ResearchProgress::WorkerStatus { worker, status } => format!("{}: {}", worker, status),
+                                ResearchProgress::Started => "🚀 Starting research...".to_string(),
+                                ResearchProgress::Decomposing => "🔍 Decomposing query into sub-questions...".to_string(),
+                                ResearchProgress::PlanningIteration(i, max) => format!("📋 Planning iteration {}/{}", i, max),
+                                ResearchProgress::PlanGenerated(n) => format!("✓ Generated plan with {} sub-questions", n),
+                                ResearchProgress::PlanCriticReviewing(i, max) => format!("🔎 Plan critic reviewing (iteration {}/{})", i, max),
+                                ResearchProgress::PlanApproved => "✅ Plan approved, starting research".to_string(),
+                                ResearchProgress::WorkersStarted(n) => format!("👥 Dispatching {} research workers...", n),
+                                ResearchProgress::WorkerStarted { worker, question } => format!("→ {}: researching — {}", worker, question),
+                                ResearchProgress::WorkerStatus { worker, status } => format!("  {}: {}", worker, status),
                                 ResearchProgress::WorkerCompleted(name) => format!("✓ {} completed", name),
-                                ResearchProgress::Combining => "Combining research results...".to_string(),
-                                ResearchProgress::CriticReviewing => "Critic reviewing output...".to_string(),
-                                ResearchProgress::DebateRound(current, max) => format!("Debate round {}/{} in progress...", current, max),
-                                ResearchProgress::Refining(current, max) => format!("Refining output (iteration {}/{})", current, max),
-                                ResearchProgress::WritingDocument(current, max) => format!("Writing document (iteration {}/{})", current, max),
-                                ResearchProgress::DocumentReviewing => "Document critic reviewing...".to_string(),
-                                ResearchProgress::Completed => "Research complete!".to_string(),
+                                ResearchProgress::SupervisorAnalyzing => "👁️ Supervisor analyzing progress...".to_string(),
+                                ResearchProgress::FollowUpQuestionsGenerated(n) => format!("📝 Generated {} follow-up questions", n),
+                                ResearchProgress::Combining => "🔗 Combining research results...".to_string(),
+                                ResearchProgress::Summarizing => "📊 Summarizing worker results...".to_string(),
+                                ResearchProgress::CriticReviewing => "🔎 Critic reviewing output...".to_string(),
+                                ResearchProgress::DebateRound(current, max) => format!("💬 Debate round {}/{} in progress...", current, max),
+                                ResearchProgress::Refining(current, max) => format!("✨ Refining output (iteration {}/{})", current, max),
+                                ResearchProgress::WritingDocument(current, max) => format!("✍️ Writing document (iteration {}/{})", current, max),
+                                ResearchProgress::DocumentReviewing => "📝 Document critic reviewing...".to_string(),
+                                ResearchProgress::ExportingMemories => "💾 Exporting research memories...".to_string(),
+                                ResearchProgress::Completed => "🎉 Research complete!".to_string(),
                             };
                             if let Ok(mut g) = RESEARCH_PROGRESS_GLOBAL.lock() {
                                 *g = Some(msg);
@@ -848,12 +863,19 @@ impl App {
                         }
                     });
 
-                    // Run the research task
+                    // Run the research task with cancellation support
                     Task::perform(
                         async move {
-                            let mut orch = orchestrator.lock().await;
-                            orch.set_progress_channel(progress_tx);
-                            orch.research(&query).await
+                            tokio::select! {
+                                result = async {
+                                    let mut orch = orchestrator.lock().await;
+                                    orch.set_progress_channel(progress_tx);
+                                    orch.research(&query).await
+                                } => result,
+                                _ = cancel_token.cancelled() => {
+                                    Err(anyhow::anyhow!("Query cancelled by user"))
+                                }
+                            }
                         },
                         |result| match result {
                             Ok(response) => Message::ResponseReceived(response),
@@ -902,6 +924,7 @@ impl App {
                 self.is_loading = false;
                 self.research_progress = None;
                 self.research_start_time = None;
+                self.current_query_cancel = None;  // Clear cancellation token
                 if let Ok(mut g) = RESEARCH_PROGRESS_GLOBAL.lock() { *g = None; }
                 crate::tools::clear_current_sources();
                 crate::progress::clear();
@@ -940,9 +963,26 @@ impl App {
                 self.response_text = error;
                 self.streaming_text = String::new();
                 self.is_loading = false;
+                self.current_query_cancel = None;  // Clear cancellation token
                 if let Ok(mut g) = RESEARCH_PROGRESS_GLOBAL.lock() { *g = None; }
                 crate::tools::clear_current_sources();
                 crate::progress::clear();
+                Task::none()
+            }
+            Message::CancelQuery => {
+                // Cancel the current query/research if one is running
+                if let Some(cancel_token) = &self.current_query_cancel {
+                    cancel_token.cancel();
+                    self.response_text = "Query cancelled by user".to_string();
+                    self.streaming_text = String::new();
+                    self.is_loading = false;
+                    self.research_progress = None;
+                    self.research_start_time = None;
+                    self.current_query_cancel = None;
+                    if let Ok(mut g) = RESEARCH_PROGRESS_GLOBAL.lock() { *g = None; }
+                    crate::tools::clear_current_sources();
+                    crate::progress::clear();
+                }
                 Task::none()
             }
             Message::Tick => {
@@ -988,19 +1028,27 @@ impl App {
                 use research::ResearchProgress;
 
                 let progress_text = match progress {
-                    ResearchProgress::Started => "Starting research...".to_string(),
-                    ResearchProgress::Decomposing => "Decomposing query into sub-questions...".to_string(),
-                    ResearchProgress::WorkersStarted(n) => format!("Dispatching {} research workers...", n),
-                    ResearchProgress::WorkerStarted { worker, question } => format!("{}: researching — {}", worker, question),
-                    ResearchProgress::WorkerStatus { worker, status } => format!("{}: {}", worker, status),
+                    ResearchProgress::Started => "🚀 Starting research...".to_string(),
+                    ResearchProgress::Decomposing => "🔍 Decomposing query into sub-questions...".to_string(),
+                    ResearchProgress::PlanningIteration(i, max) => format!("📋 Planning iteration {}/{}", i, max),
+                    ResearchProgress::PlanGenerated(n) => format!("✓ Generated plan with {} sub-questions", n),
+                    ResearchProgress::PlanCriticReviewing(i, max) => format!("🔎 Plan critic reviewing (iteration {}/{})", i, max),
+                    ResearchProgress::PlanApproved => "✅ Plan approved, starting research".to_string(),
+                    ResearchProgress::WorkersStarted(n) => format!("👥 Dispatching {} research workers...", n),
+                    ResearchProgress::WorkerStarted { worker, question } => format!("→ {}: researching — {}", worker, question),
+                    ResearchProgress::WorkerStatus { worker, status } => format!("  {}: {}", worker, status),
                     ResearchProgress::WorkerCompleted(name) => format!("✓ {} completed", name),
-                    ResearchProgress::Combining => "Combining research results...".to_string(),
-                    ResearchProgress::CriticReviewing => "Critic reviewing output...".to_string(),
-                    ResearchProgress::DebateRound(current, max) => format!("Debate round {}/{} in progress...", current, max),
-                    ResearchProgress::Refining(current, max) => format!("Refining output (iteration {}/{})", current, max),
-                    ResearchProgress::WritingDocument(current, max) => format!("Writing document (iteration {}/{})", current, max),
-                    ResearchProgress::DocumentReviewing => "Document critic reviewing...".to_string(),
-                    ResearchProgress::Completed => "Research complete!".to_string(),
+                    ResearchProgress::SupervisorAnalyzing => "👁️ Supervisor analyzing progress...".to_string(),
+                    ResearchProgress::FollowUpQuestionsGenerated(n) => format!("📝 Generated {} follow-up questions", n),
+                    ResearchProgress::Combining => "🔗 Combining research results...".to_string(),
+                    ResearchProgress::Summarizing => "📊 Summarizing worker results...".to_string(),
+                    ResearchProgress::CriticReviewing => "🔎 Critic reviewing output...".to_string(),
+                    ResearchProgress::DebateRound(current, max) => format!("💬 Debate round {}/{} in progress...", current, max),
+                    ResearchProgress::Refining(current, max) => format!("✨ Refining output (iteration {}/{})", current, max),
+                    ResearchProgress::WritingDocument(current, max) => format!("✍️ Writing document (iteration {}/{})", current, max),
+                    ResearchProgress::DocumentReviewing => "📝 Document critic reviewing...".to_string(),
+                    ResearchProgress::ExportingMemories => "💾 Exporting research memories...".to_string(),
+                    ResearchProgress::Completed => "🎉 Research complete!".to_string(),
                 };
 
                 self.research_progress = Some(progress_text);
@@ -1022,6 +1070,10 @@ impl App {
                 clipboard::write(self.response_text.clone())
             }
             Message::Exit => {
+                // If a query is running, cancel it instead of exiting
+                if self.is_loading || self.current_query_cancel.is_some() {
+                    return self.update(Message::CancelQuery);
+                }
                 iced::exit()
             }
             Message::ToggleFullscreen => {

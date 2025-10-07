@@ -30,6 +30,14 @@ fn default_max_debate_rounds() -> usize {
     2
 }
 
+fn default_max_plan_iterations() -> usize {
+    3
+}
+
+fn default_api_delay_ms() -> u64 {
+    100  // Reduced from 500ms to 100ms
+}
+
 fn default_embedding_model() -> String {
     "nomic-embed-text".to_string()
 }
@@ -62,7 +70,7 @@ fn default_summarization_threshold() -> usize {
 }
 
 fn default_summarization_threshold_research() -> usize {
-    10000
+    50000  // 50K chars = ~12.5K tokens per worker result before summarization
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -85,6 +93,10 @@ pub struct OllamaConfig {
     pub max_document_iterations: usize,
     #[serde(default = "default_max_debate_rounds")]
     pub max_debate_rounds: usize,
+    #[serde(default = "default_max_plan_iterations")]
+    pub max_plan_iterations: usize,
+    #[serde(default = "default_api_delay_ms")]
+    pub api_delay_ms: u64,
     #[serde(default = "default_context_window")]
     pub context_window: usize,
     #[serde(default = "default_max_tool_turns")]
@@ -133,10 +145,12 @@ impl Default for Config {
                 max_refinement_iterations: 5,
                 max_document_iterations: 3,
                 max_debate_rounds: 2,
+                max_plan_iterations: 3,
+                api_delay_ms: 100,
                 context_window: 128000,
                 max_tool_turns: 5,
                 summarization_threshold: 5000,
-                summarization_threshold_research: 10000,
+                summarization_threshold_research: 50000,
             },
             research: ResearchConfig::default(),
         }

@@ -10,17 +10,25 @@ use std::collections::BTreeSet;
 pub enum ResearchProgress {
     Started,
     Decomposing,
+    PlanningIteration(usize, usize), // current iteration, max iterations
+    PlanGenerated(usize), // number of sub-questions
+    PlanCriticReviewing(usize, usize), // iteration, max
+    PlanApproved,
     WorkersStarted(usize), // number of workers
     WorkerCompleted(String), // worker name
     #[allow(dead_code)]
     WorkerStarted { worker: String, question: String },
     WorkerStatus { worker: String, status: String },
+    SupervisorAnalyzing,
+    FollowUpQuestionsGenerated(usize), // number of follow-ups
     Combining,
+    Summarizing,
     Refining(usize, usize), // current iteration, max iterations
     CriticReviewing,
     DebateRound(usize, usize), // current round, max rounds
     WritingDocument(usize, usize), // current iteration, max iterations
     DocumentReviewing,
+    ExportingMemories,
     Completed,
 }
 
@@ -38,6 +46,7 @@ pub struct Agents {
     pub refiner: AgentRole,
     pub writer: AgentRole,
     pub document_critic: AgentRole,
+    pub plan_critic: AgentRole,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -64,7 +73,7 @@ impl Default for ResearchConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubQuestion {
     pub question: String,
     pub assigned_worker: String,
@@ -109,6 +118,9 @@ impl ResearchOrchestrator {
                 None
             }
         };
+
+        eprintln!("[Research] Initializing with summarization_threshold_research = {} chars",
+                  ollama_config.summarization_threshold_research);
 
         Self {
             config,
@@ -163,6 +175,10 @@ impl ResearchOrchestrator {
         let (line, kind) = match progress {
             ResearchProgress::Started => ("Research started".to_string(), Kind::Info),
             ResearchProgress::Decomposing => ("Decomposing query into sub-questions".to_string(), Kind::Info),
+            ResearchProgress::PlanningIteration(i, max) => (format!("Planning iteration {}/{}", i, max), Kind::Info),
+            ResearchProgress::PlanGenerated(n) => (format!("Generated plan with {} sub-questions", n), Kind::Info),
+            ResearchProgress::PlanCriticReviewing(i, max) => (format!("Plan critic reviewing (iteration {}/{})", i, max), Kind::Debate),
+            ResearchProgress::PlanApproved => ("Plan approved, starting research".to_string(), Kind::Info),
             ResearchProgress::WorkersStarted(n) => (format!("Dispatching {} workers", n), Kind::Worker),
             ResearchProgress::WorkerCompleted(name) => (format!("✓ Worker completed: {}", name), Kind::Worker),
             ResearchProgress::WorkerStarted { worker, question } => (format!("→ {} researching: {}", worker, question), Kind::Worker),
@@ -177,12 +193,16 @@ impl ResearchOrchestrator {
                 };
                 (format!("{}: {}", worker, status), k)
             },
+            ResearchProgress::SupervisorAnalyzing => ("Supervisor analyzing progress".to_string(), Kind::Info),
+            ResearchProgress::FollowUpQuestionsGenerated(n) => (format!("Generated {} follow-up questions", n), Kind::Worker),
             ResearchProgress::Combining => ("Combining results".to_string(), Kind::Combiner),
+            ResearchProgress::Summarizing => ("Summarizing worker results".to_string(), Kind::Combiner),
             ResearchProgress::Refining(i, max) => (format!("Refining output (iteration {}/{})", i, max), Kind::Refiner),
             ResearchProgress::CriticReviewing => ("Critic reviewing output".to_string(), Kind::Debate),
             ResearchProgress::DebateRound(i, max) => (format!("Debate round {}/{}", i, max), Kind::Debate),
             ResearchProgress::WritingDocument(i, max) => (format!("Writing document (iteration {}/{})", i, max), Kind::Writer),
             ResearchProgress::DocumentReviewing => ("Document critic reviewing".to_string(), Kind::DocumentCritic),
+            ResearchProgress::ExportingMemories => ("Exporting research memories".to_string(), Kind::Info),
             ResearchProgress::Completed => ("Research complete".to_string(), Kind::Info),
         };
         log_with(kind, line);
@@ -218,6 +238,16 @@ impl ResearchOrchestrator {
 
         eprintln!("[Research] Starting query: {} (ID: {})", query, query_id);
         self.send_progress(ResearchProgress::Started);
+
+        // Clear previous memories from database to start fresh
+        if let Some(ref shared_memory) = self.shared_memory {
+            eprintln!("[Research] Clearing previous memories from database...");
+            if let Err(e) = shared_memory.clear().await {
+                eprintln!("[Research] Warning: Failed to clear memories: {}", e);
+            } else {
+                eprintln!("[Research] ✓ Memories cleared, starting fresh research session");
+            }
+        }
 
         // Step 1: Decompose query into sub-questions and create plan
         self.send_progress(ResearchProgress::Decomposing);
@@ -275,6 +305,7 @@ impl ResearchOrchestrator {
         if let Some(ref shared_memory) = self.shared_memory {
             // Check config for memory export
             if self.export_memories {
+                self.send_progress(ResearchProgress::ExportingMemories);
                 // Get all memories from current query
                 let stats = shared_memory.get_stats().await;
                 let discoveries = shared_memory.get_by_type(crate::shared_memory::MemoryType::Discovery).await;
@@ -394,6 +425,59 @@ impl ResearchOrchestrator {
 
     /// Decompose query into sub-questions and create research plan using lead agent
     async fn decompose_query_and_plan(&self, query: &str) -> Result<(Vec<SubQuestion>, String)> {
+        let max_iterations = self.ollama_config.max_plan_iterations;
+        let mut current_plan = String::new();
+        let mut current_questions_json = String::new();
+
+        for iteration in 0..max_iterations {
+            self.send_progress(ResearchProgress::PlanningIteration(iteration + 1, max_iterations));
+            eprintln!("[Research] Planning iteration {}/{}", iteration + 1, max_iterations);
+
+            // Generate or refine the plan
+            let (plan_response, questions_json) = if iteration == 0 {
+                // Initial plan generation
+                self.generate_initial_plan(query).await?
+            } else {
+                // Refine plan based on criticism
+                self.refine_plan(query, &current_plan, &current_questions_json).await?
+            };
+
+            current_plan = plan_response;
+            current_questions_json = questions_json.clone();
+
+            // Parse to get question count for progress
+            if let Ok(parsed) = serde_json::from_str::<Vec<SubQuestion>>(&questions_json) {
+                self.send_progress(ResearchProgress::PlanGenerated(parsed.len()));
+            }
+
+            // Get plan critic feedback
+            self.send_progress(ResearchProgress::PlanCriticReviewing(iteration + 1, max_iterations));
+            eprintln!("[Research] Reviewing plan with plan critic...");
+            let criticism = self.review_plan(query, &current_plan, &questions_json).await?;
+
+            // Check if approved
+            if criticism.trim().to_uppercase().starts_with("APPROVED") {
+                self.send_progress(ResearchProgress::PlanApproved);
+                eprintln!("[Research] Plan approved after {} iteration(s)", iteration + 1);
+                break;
+            }
+
+            // If not approved and not last iteration, we'll refine in next iteration
+            eprintln!("[Research] Plan iteration {}: Feedback received, will revise", iteration + 1);
+
+            // On last iteration, use what we have
+            if iteration == max_iterations - 1 {
+                self.send_progress(ResearchProgress::PlanApproved);
+                eprintln!("[Research] Max plan iterations reached. Using current plan.");
+            }
+        }
+
+        // Parse the final plan
+        self.parse_plan(&current_questions_json, &current_plan).await
+    }
+
+    /// Generate initial research plan
+    async fn generate_initial_plan(&self, query: &str) -> Result<(String, String)> {
         let prompt = format!(
             "{}\n\n**WORKER COUNT GUIDANCE**: Based on query complexity, create between {} and {} sub-questions. \
             Simple queries should use fewer workers (closer to {}), while complex multi-faceted queries should \
@@ -409,7 +493,6 @@ impl ResearchOrchestrator {
             query
         );
 
-        // Create a temporary client for lead agent (no tools needed)
         let base_url = std::env::var("OLLAMA_HOST")
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
@@ -418,22 +501,81 @@ impl ResearchOrchestrator {
 
         let response = lead_client.query_streaming(&prompt, |_| {}).await?;
 
-        // Parse JSON response - expecting array of {question, worker} objects
-        let cleaned = self.extract_json_array(&response)?;
+        // Extract JSON array
+        let json = self.extract_json_array(&response)?;
 
+        Ok((response, json))
+    }
+
+    /// Refine plan based on critic feedback
+    async fn refine_plan(&self, query: &str, previous_plan: &str, _previous_json: &str) -> Result<(String, String)> {
+        let prompt = format!(
+            "{}\n\n**WORKER COUNT GUIDANCE**: Based on query complexity, create between {} and {} sub-questions.\n\n\
+            Original Query: {}\n\n\
+            Previous Plan (with feedback):\n{}\n\n\
+            Revise the plan to address the feedback. Provide:\n\
+            1. JSON array of revised sub-questions\n\
+            2. After the JSON, provide updated research strategy",
+            self.config.agents.lead.system_prompt,
+            self.config.config.min_worker_count,
+            self.config.config.max_worker_count,
+            query,
+            previous_plan
+        );
+
+        let base_url = std::env::var("OLLAMA_HOST")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+
+        let mut lead_client = OllamaClient::with_config(base_url, self.research_model.clone());
+        lead_client.set_max_tool_turns(self.max_tool_turns);
+
+        let response = lead_client.query_streaming(&prompt, |_| {}).await?;
+
+        // Extract JSON array
+        let json = self.extract_json_array(&response)?;
+
+        Ok((response, json))
+    }
+
+    /// Review plan with plan critic
+    async fn review_plan(&self, query: &str, plan: &str, questions_json: &str) -> Result<String> {
+        tokio::time::sleep(tokio::time::Duration::from_millis(self.ollama_config.api_delay_ms)).await;
+
+        let prompt = format!(
+            "{}\n\nOriginal Query: {}\n\n\
+            Research Plan:\n{}\n\n\
+            Questions (JSON):\n{}",
+            self.config.agents.plan_critic.system_prompt,
+            query,
+            plan,
+            questions_json
+        );
+
+        let base_url = std::env::var("OLLAMA_HOST")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+
+        let mut critic_client = OllamaClient::with_config(base_url, self.research_model.clone());
+        critic_client.set_max_tool_turns(self.max_tool_turns);
+        let review = critic_client.query_streaming(&prompt, |_| {}).await?;
+
+        Ok(review)
+    }
+
+    /// Parse plan into sub-questions
+    async fn parse_plan(&self, questions_json: &str, plan_text: &str) -> Result<(Vec<SubQuestion>, String)> {
         #[derive(Deserialize)]
         struct QuestionAssignment {
             question: String,
             worker: String,
         }
 
-        let assignments: Vec<QuestionAssignment> = serde_json::from_str(&cleaned)?;
+        let assignments: Vec<QuestionAssignment> = serde_json::from_str(questions_json)?;
 
-        // Extract plan/strategy (everything after the JSON array)
-        let plan = if let Some(json_end) = response.rfind(']') {
-            response[json_end + 1..].trim().to_string()
+        // Extract plan/strategy from plan_text
+        let plan = if let Some(json_end) = plan_text.rfind(']') {
+            plan_text[json_end + 1..].trim().to_string()
         } else {
-            "Follow standard research approach.".to_string()
+            plan_text.trim().to_string()
         };
 
         // Log the planner's decisions in debug mode
@@ -613,6 +755,8 @@ impl ResearchOrchestrator {
             let progress_tx = self.progress_tx.clone();
             let shared_memory = self.shared_memory.clone();
 
+            let api_delay_ms = self.ollama_config.api_delay_ms;
+            let summarization_threshold_research = self.ollama_config.summarization_threshold_research;
             let handle = tokio::spawn(async move {
                 let result = Self::execute_worker(
                     worker.unwrap(),
@@ -623,6 +767,8 @@ impl ResearchOrchestrator {
                     max_tool_turns,
                     progress_tx,
                     shared_memory,
+                    api_delay_ms,
+                    summarization_threshold_research,
                 )
                 .await;
 
@@ -681,6 +827,8 @@ impl ResearchOrchestrator {
                             let progress_tx = self.progress_tx.clone();
                             let shared_memory = self.shared_memory.clone();
 
+            let api_delay_ms = self.ollama_config.api_delay_ms;
+            let summarization_threshold_research = self.ollama_config.summarization_threshold_research;
                             let handle = tokio::spawn(async move {
                                 let result = Self::execute_worker(
                                     worker.unwrap(),
@@ -691,6 +839,8 @@ impl ResearchOrchestrator {
                                     max_tool_turns,
                                     progress_tx,
                                     shared_memory,
+                                    api_delay_ms,
+                                    summarization_threshold_research,
                                 )
                                 .await;
 
@@ -750,6 +900,8 @@ impl ResearchOrchestrator {
                     let progress_tx = self.progress_tx.clone();
                     let ollama_config = self.ollama_config.clone();
                     let shared_memory = self.shared_memory.clone();
+                    let api_delay_ms_clone = self.ollama_config.api_delay_ms;
+                    let summarization_threshold_research = self.ollama_config.summarization_threshold_research;
 
                     tokio::spawn(async move {
                         // Generate follow-up questions
@@ -764,6 +916,10 @@ impl ResearchOrchestrator {
                         if let Ok(follow_ups) = follow_ups {
                             if !follow_ups.is_empty() {
                                 eprintln!("[Research] Launching {} follow-up workers...", follow_ups.len());
+                                // Send progress update (need to access progress_tx from outer scope)
+                                if let Some(ref ptx) = progress_tx {
+                                    let _ = ptx.send(ResearchProgress::FollowUpQuestionsGenerated(follow_ups.len()));
+                                }
                                 // Launch follow-up workers
                                 for follow_up in follow_ups {
                                     let worker = config.agents.workers
@@ -777,6 +933,8 @@ impl ResearchOrchestrator {
                                         let research_model = research_model.clone();
                                         let progress_tx = progress_tx.clone();
                                         let shared_memory = shared_memory.clone();
+                                        let api_delay_ms = api_delay_ms_clone;
+                                        let summarization_threshold_research = summarization_threshold_research;
 
                                         tokio::spawn(async move {
                                             let _ = Self::execute_worker(
@@ -788,6 +946,8 @@ impl ResearchOrchestrator {
                                                 max_tool_turns,
                                                 progress_tx,
                                                 shared_memory,
+                                                api_delay_ms,
+                                                summarization_threshold_research,
                                             ).await;
                                         });
                                     }
@@ -1108,6 +1268,8 @@ impl ResearchOrchestrator {
                 let _ = p.send(ResearchProgress::WorkerStarted { worker: worker.name.clone(), question: sub_q.question.clone() });
             }
 
+            let api_delay_ms = self.ollama_config.api_delay_ms;
+            let summarization_threshold_research = self.ollama_config.summarization_threshold_research;
             let handle = tokio::spawn(async move {
                 let result = Self::execute_worker(
                     worker,
@@ -1118,6 +1280,8 @@ impl ResearchOrchestrator {
                     max_tool_turns,
                     progress_tx.clone(),
                     shared_memory,
+                    api_delay_ms,
+                    summarization_threshold_research,
                 ).await;
 
                 let worker_result = match result {
@@ -1278,9 +1442,11 @@ impl ResearchOrchestrator {
         max_tool_turns: usize,
         progress_tx: Option<mpsc::UnboundedSender<ResearchProgress>>,
         shared_memory: Option<Arc<crate::shared_memory::SharedMemory>>,
+        api_delay_ms: u64,
+        summarization_threshold_research: usize,
     ) -> Result<String> {
         // Add small delay to avoid rate limiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(api_delay_ms)).await;
 
         let base_url = std::env::var("OLLAMA_HOST")
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
@@ -1288,8 +1454,8 @@ impl ResearchOrchestrator {
         let mut worker_client = OllamaClient::with_config(base_url, research_model.clone());
         worker_client.set_max_tool_turns(max_tool_turns);
 
-        // Configure research mode summarization with higher threshold (10000 chars)
-        worker_client.set_summarization_config(None, 10000, true);
+        // Configure research mode summarization with threshold from config
+        worker_client.set_summarization_config(None, summarization_threshold_research, true);
 
         // Set tool executor and available tools if available
         if let Some(ref executor) = tool_executor {
@@ -1355,12 +1521,24 @@ impl ResearchOrchestrator {
             ctx.build_prompt_context().await.unwrap_or_default()
         };
 
+        // Strong reminder to store discoveries in memory
+        let memory_workflow = "\n\n>>> MANDATORY WORKFLOW - FOLLOW EXACTLY <<<\n\n\
+            1. Call research tool\n\
+            2. IMMEDIATELY: memory_store(type=\"discovery\", content=\"Fact [Source: Name](URL)\", agent=\"your_role\")\n\
+            3. Call another research tool\n\
+            4. IMMEDIATELY: memory_store(type=\"discovery\", content=\"Another fact [Source](URL)\", agent=\"your_role\")\n\
+            5. Repeat steps 1-4 until you have 3-5 discoveries\n\
+            6. Write final comprehensive answer\n\n\
+            CRITICAL: Store discoveries IMMEDIATELY after each tool call!\n\
+            Other agents cannot see your findings unless stored in memory.\n\n";
+
         let prompt = format!(
-            "{}\n\n\
+            "{}{}\n\
             CITATION REQUIREMENT: When citing sources, ALWAYS prefer full URLs when available. Use format [Source: https://full-url.com] instead of just site names. This enables independent verification.\n\n\
             {}\n\n\
             Question: {}",
             context_section,
+            memory_workflow,
             worker.system_prompt,
             question
         );
@@ -1381,25 +1559,24 @@ impl ResearchOrchestrator {
 
     /// Summarize a long worker result to reduce token count
     async fn summarize_worker_result(&self, result: &WorkerResult, _num_workers: usize) -> Result<String> {
-        // Each agent has their own complete context, so we don't need to split
-        // the context window. Only summarize if result is extremely long.
-        // Reserve 20% for prompts, system messages, and overhead
-        let available_tokens = (self.context_window as f64 * 0.8) as usize;
-        let max_chars = available_tokens * 4; // 4 chars ≈ 1 token
+        // Use the research-specific summarization threshold (default: 50K chars)
+        // This is much higher than regular chat to preserve detailed research findings
+        let max_chars = self.ollama_config.summarization_threshold_research;
 
-        eprintln!("[Research] Context window: {}, Max chars per result: ~{}",
-                  self.context_window, max_chars);
+        eprintln!("[Research] Summarization threshold: {} chars, Worker result: {} chars",
+                  max_chars, result.answer.len());
 
         // If result is within limit, return as-is
         if result.answer.len() <= max_chars {
+            eprintln!("[Research] Worker result within threshold, keeping full content");
             return Ok(result.answer.clone());
         }
 
-        eprintln!("[Research] Worker result too long ({} chars), summarizing to fit ~{} chars...",
+        eprintln!("[Research] Worker result exceeds threshold ({} > {} chars), summarizing...",
                   result.answer.len(), max_chars);
 
         // Add delay to avoid rate limiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(self.ollama_config.api_delay_ms)).await;
 
         let base_url = std::env::var("OLLAMA_HOST")
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
@@ -1442,7 +1619,12 @@ impl ResearchOrchestrator {
         let mut output = format!("# Research Results for: {}\n\n", original_query);
         let num_workers = results.len();
 
-        for result in results {
+        for (idx, result) in results.iter().enumerate() {
+            // Show progress for summarization if needed
+            if result.answer.len() > self.ollama_config.summarization_threshold_research {
+                self.send_progress(ResearchProgress::Summarizing);
+            }
+
             // Summarize if needed based on available context per worker
             let answer = self.summarize_worker_result(result, num_workers).await?;
 
@@ -1637,7 +1819,7 @@ impl ResearchOrchestrator {
                 status: format!("Advocate presenting arguments (round {}/{})", round, max_rounds),
             });
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(self.ollama_config.api_delay_ms)).await;
 
             // Advocate's turn
             let advocate_prompt = if round == 1 {
@@ -1682,7 +1864,7 @@ impl ResearchOrchestrator {
             debate_history.push_str(&format!("\n--- Round {} ---\n", round));
             debate_history.push_str(&format!("**Advocate:**\n{}\n\n", last_advocate_arg));
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(self.ollama_config.api_delay_ms)).await;
 
             // Skeptic's turn
             self.send_progress(ResearchProgress::WorkerStatus {
@@ -1732,7 +1914,7 @@ impl ResearchOrchestrator {
             debate_history.push_str(&format!("**Skeptic:**\n{}\n\n", last_skeptic_arg));
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(self.ollama_config.api_delay_ms)).await;
 
         // Synthesizer makes final decision after all rounds
         let synthesizer_prompt = format!(
@@ -1826,7 +2008,7 @@ impl ResearchOrchestrator {
     /// Write or rewrite a document from research findings
     async fn write_document(&self, original_query: &str, research_content: &str, previous_document: Option<&str>) -> Result<String> {
         // Add delay to avoid rate limiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(self.ollama_config.api_delay_ms)).await;
 
         let prompt = if let Some(prev_doc) = previous_document {
             format!(
@@ -1863,7 +2045,7 @@ impl ResearchOrchestrator {
     /// Review document with document critic
     async fn review_document(&self, original_query: &str, document: &str) -> Result<String> {
         // Add delay to avoid rate limiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(self.ollama_config.api_delay_ms)).await;
 
         let prompt = format!(
             "{}\n\nOriginal Query: {}\n\n\
@@ -1886,7 +2068,7 @@ impl ResearchOrchestrator {
     /// Refine output based on debate conclusions
     async fn refine_output(&self, output: &str, debate_result: &str) -> Result<String> {
         // Add delay to avoid rate limiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(self.ollama_config.api_delay_ms)).await;
 
         let prompt = format!(
             "CITATION REQUIREMENT: When adding new sources, ALWAYS use full URLs when available. Format: [Source: https://full-url.com]. This enables independent verification.\n\n{}\n\nOriginal output:\n{}\n\nDebate Conclusions:\n{}\n\nProvide the improved output:",
