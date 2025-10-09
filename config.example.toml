@@ -1,4 +1,5 @@
-# bob-bar Configuration
+# bob-bar Configuration Example
+# Copy this to ~/.config/bob-bar/config.toml and customize
 
 # Ollama server configuration
 [ollama]
@@ -9,17 +10,24 @@ host = "http://localhost:11434"
 # Model to use for generating responses
 # Options: llama2, codellama, mistral, llama2:13b, etc.
 # See available models: ollama list
+# Default: llama2
 model = "llama2"
 
 # Model to use for vision/screenshot analysis
 # Default: llama3.2-vision:11b
 vision_model = "llama3.2-vision:11b"
 
-# Model to use specifically for research mode
+# Model to use specifically for research mode (optional)
 # If not set, uses the main model above
 # Research mode benefits from larger, more capable models
-# Default: uses main model
+# Default: None (uses main model)
 # research_model = "llama2:70b"
+
+# Model to use for summarization (optional)
+# If not set, uses the main model
+# Can specify a smaller/faster model for summarization tasks
+# Default: None (uses main model)
+# summarization_model = "llama2:7b"
 
 # Embedding model for vector similarity search
 # Used for query deduplication and shared memory in research mode
@@ -35,10 +43,10 @@ embedding_dimensions = 768
 # Context window size (in tokens) for the model
 # This determines how much information can be processed at once
 # Common values:
-#   - 4096: llama2, mistral (default)
+#   - 4096: llama2, mistral
 #   - 8192: codellama, larger models
 #   - 32768: llama2:70b, some fine-tuned models
-#   - 128000: gpt-4, claude-style models
+#   - 128000: gpt-4, claude-style models (default)
 # Default: 128000
 context_window = 128000
 
@@ -66,9 +74,49 @@ max_document_iterations = 3
 # Default: 2
 max_debate_rounds = 2
 
+# Maximum iterations for planning phase
+# Lead agent generates plan, plan critic reviews
+# Loop stops when plan approved OR max iterations reached
+# Default: 3
+max_plan_iterations = 3
+
+# Delay between API calls (in milliseconds)
+# Helps avoid rate limiting with Ollama server
+# Lower = faster but more aggressive
+# Higher = slower but more conservative
+# Default: 100
+api_delay_ms = 100
+
+# Summarization threshold for regular chat (in characters)
+# When output exceeds this length, it gets summarized
+# Default: 5000
+summarization_threshold = 5000
+
+# Summarization threshold for research mode (in characters)
+# Higher threshold preserves more detail in worker results
+# With 128K context window, can handle 50K chars per worker easily
+# Default: 50000 (~12,500 tokens per worker before summarization)
+# Examples:
+#   - Minimal summarization: 100000 (100K chars)
+#   - Balanced (default): 50000 (50K chars)
+#   - Aggressive: 25000 (25K chars)
+summarization_threshold_research = 50000
+
 # Research mode configuration
 [research]
-# Number of worker agents to spawn for parallel research
-# Workers research different sub-questions concurrently
+# Minimum number of worker agents to spawn
+# System will spawn at least this many workers for parallel research
 # Default: 3
-worker_count = 3
+min_worker_count = 3
+
+# Maximum number of worker agents allowed
+# System won't spawn more than this many workers
+# Includes initial workers + supervisor-requested gap-filling workers
+# Default: 10
+max_worker_count = 10
+
+# Whether to export memory summary to final document
+# If true, appends discoveries, insights, deadends, and tool calls
+# If false, only shows the final synthesized document
+# Default: false
+export_memories = false

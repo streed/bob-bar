@@ -114,23 +114,26 @@ bob-bar uses configuration files located in:
 ```toml
 [ollama]
 host = "http://localhost:11434"
-model = "llama2"                      # Model for text queries
-vision_model = "llama3.2-vision:11b"  # Model for screenshot analysis
-research_model = "llama2:70b"         # Model for research mode (optional)
-context_window = 128000               # Context window size (tokens)
-max_tool_turns = 5
+model = "llama2"                               # Model for text queries
+vision_model = "llama3.2-vision:11b"           # Model for screenshot analysis
+research_model = "llama2:70b"                  # Model for research mode (optional)
+summarization_model = "llama2:7b"              # Model for summarization (optional)
+embedding_model = "nomic-embed-text"           # Embedding model for vector search
+embedding_dimensions = 768                     # Embedding vector dimensions
+context_window = 128000                        # Context window size (tokens)
+max_tool_turns = 5                             # Max tool iterations per query
+max_refinement_iterations = 5                  # Critic-refiner loop iterations
+max_document_iterations = 3                    # Document writing iterations
+max_debate_rounds = 2                          # Multi-round debate rounds
+max_plan_iterations = 3                        # Planning iterations
+api_delay_ms = 100                             # Delay between API calls (ms)
+summarization_threshold = 5000                 # Chat summarization threshold (chars)
+summarization_threshold_research = 50000       # Research summarization threshold (chars)
 
 [research]
-max_refinement_iterations = 5         # Debate/refine loop iterations
-max_document_iterations = 3           # Document writing iterations
-max_debate_rounds = 2                 # Multi-round debate rounds
-worker_count = 3                      # Parallel research workers
-
-[window]
-width = 1200
-height = 1200
-min_width = 400
-min_height = 300
+min_worker_count = 3                           # Minimum parallel research workers
+max_worker_count = 10                          # Maximum parallel research workers
+export_memories = false                        # Export memory summary to document
 ```
 
 ### `~/.config/bob-bar/api_keys.toml` (Optional)
