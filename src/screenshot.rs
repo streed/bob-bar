@@ -2,64 +2,115 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
 use image::GenericImageView;
+use crate::config::Config;
 
 pub fn capture_screenshot() -> Result<PathBuf> {
-    eprintln!("[Screenshot] Starting screenshot capture...");
+    capture_screenshot_with_options(false)
+}
 
-    // Generate temp file path
-    let temp_path = std::env::temp_dir().join(format!("bob-bar-screenshot-{}.png",
+pub fn capture_screenshot_region() -> Result<PathBuf> {
+    capture_screenshot_with_options(true)
+}
+
+fn capture_screenshot_with_options(region_mode: bool) -> Result<PathBuf> {
+    eprintln!("[Screenshot] Starting screenshot capture{}...", if region_mode { " (region mode)" } else { "" });
+
+    // Ensure images directory exists
+    let images_dir = Config::get_config_dir().join("images");
+    std::fs::create_dir_all(&images_dir)
+        .context("Failed to create images directory")?;
+
+    // Generate file path in config directory
+    let screenshot_path = images_dir.join(format!("screenshot-{}.png",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
     ));
 
-    eprintln!("[Screenshot] Output path: {}", temp_path.display());
+    eprintln!("[Screenshot] Output path: {}", screenshot_path.display());
 
     // Try Wayland first (grim)
-    let wayland_result = Command::new("grim")
-        .arg(&temp_path)
-        .output();
+    let mut grim_cmd = Command::new("grim");
+    if region_mode {
+        grim_cmd.arg("-g");
+        grim_cmd.arg("-");  // Use slurp to select region
+        // On Wayland with grim, we need slurp for region selection
+        // Run: grim -g "$(slurp)" output.png
+        let slurp_result = Command::new("slurp").output();
+        if let Ok(slurp_output) = slurp_result {
+            if slurp_output.status.success() {
+                let geometry = String::from_utf8_lossy(&slurp_output.stdout).trim().to_string();
+                eprintln!("[Screenshot] Selected region: {}", geometry);
+                let wayland_result = Command::new("grim")
+                    .arg("-g")
+                    .arg(geometry)
+                    .arg(&screenshot_path)
+                    .output();
 
-    if let Ok(output) = wayland_result {
-        if output.status.success() && temp_path.exists() {
-            eprintln!("[Screenshot] Screenshot captured with grim (Wayland)");
-            return Ok(temp_path);
+                if let Ok(output) = wayland_result {
+                    if output.status.success() && screenshot_path.exists() {
+                        eprintln!("[Screenshot] Screenshot captured with grim + slurp (Wayland)");
+                        return Ok(screenshot_path);
+                    }
+                    eprintln!("[Screenshot] grim failed: {}", String::from_utf8_lossy(&output.stderr));
+                }
+            } else {
+                eprintln!("[Screenshot] slurp selection cancelled or failed");
+                return Err(anyhow::anyhow!("Region selection cancelled"));
+            }
         }
-        eprintln!("[Screenshot] grim failed: {}", String::from_utf8_lossy(&output.stderr));
+    } else {
+        let wayland_result = Command::new("grim")
+            .arg(&screenshot_path)
+            .output();
+
+        if let Ok(output) = wayland_result {
+            if output.status.success() && screenshot_path.exists() {
+                eprintln!("[Screenshot] Screenshot captured with grim (Wayland)");
+                return Ok(screenshot_path);
+            }
+            eprintln!("[Screenshot] grim failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
     }
 
     // Try X11 fallback (scrot)
     eprintln!("[Screenshot] Trying X11 fallback (scrot)...");
-    let x11_result = Command::new("scrot")
-        .arg(&temp_path)
+    let mut scrot_cmd = Command::new("scrot");
+    if region_mode {
+        scrot_cmd.arg("-s");  // Select region interactively
+    }
+    let x11_result = scrot_cmd
+        .arg(&screenshot_path)
         .output();
 
     if let Ok(output) = x11_result {
-        if output.status.success() && temp_path.exists() {
+        if output.status.success() && screenshot_path.exists() {
             eprintln!("[Screenshot] Screenshot captured with scrot (X11)");
-            return Ok(temp_path);
+            return Ok(screenshot_path);
         }
         eprintln!("[Screenshot] scrot failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     // Try gnome-screenshot as last resort
     eprintln!("[Screenshot] Trying gnome-screenshot fallback...");
-    let gnome_result = Command::new("gnome-screenshot")
-        .arg("-f")
-        .arg(&temp_path)
-        .output();
+    let mut gnome_cmd = Command::new("gnome-screenshot");
+    gnome_cmd.arg("-f").arg(&screenshot_path);
+    if region_mode {
+        gnome_cmd.arg("-a");  // Area selection
+    }
+    let gnome_result = gnome_cmd.output();
 
     if let Ok(output) = gnome_result {
-        if output.status.success() && temp_path.exists() {
+        if output.status.success() && screenshot_path.exists() {
             eprintln!("[Screenshot] Screenshot captured with gnome-screenshot");
-            return Ok(temp_path);
+            return Ok(screenshot_path);
         }
         eprintln!("[Screenshot] gnome-screenshot failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     Err(anyhow::anyhow!(
-        "Failed to capture screenshot. Please install one of: grim (Wayland), scrot (X11), or gnome-screenshot"
+        "Failed to capture screenshot. Please install one of: grim + slurp (Wayland), scrot (X11), or gnome-screenshot"
     ))
 }
 

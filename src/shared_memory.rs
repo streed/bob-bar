@@ -157,7 +157,7 @@ impl SharedMemory {
             .unwrap_or(false);
 
         if table_exists {
-            // Check if the existing table has the old TEXT schema
+            // Check if the existing table has the old TEXT schema or wrong dimensions
             // Try to detect by checking the sql definition
             let table_sql: String = db
                 .query_row(
@@ -167,9 +167,41 @@ impl SharedMemory {
                 )
                 .unwrap_or_default();
 
-            // If it contains "TEXT PRIMARY KEY", we need to recreate with INTEGER
-            if table_sql.contains("TEXT PRIMARY KEY") {
-                eprintln!("[SharedMemory] Detected old vec_memories schema (TEXT). Recreating with INTEGER...");
+            let needs_recreation = if table_sql.contains("TEXT PRIMARY KEY") {
+                eprintln!("[SharedMemory] Detected old vec_memories schema (TEXT). Need to recreate with INTEGER...");
+                true
+            } else {
+                // Check if dimensions match by extracting FLOAT[N] from the schema
+                let dimension_regex = regex::Regex::new(r"FLOAT\[(\d+)\]").unwrap();
+                if let Some(captures) = dimension_regex.captures(&table_sql) {
+                    if let Some(dim_str) = captures.get(1) {
+                        if let Ok(current_dim) = dim_str.as_str().parse::<usize>() {
+                            if current_dim != embedding_dimensions {
+                                eprintln!(
+                                    "[SharedMemory] Detected dimension mismatch: table has {}, config has {}. Need to recreate...",
+                                    current_dim, embedding_dimensions
+                                );
+                                true
+                            } else {
+                                eprintln!("[SharedMemory] ✓ vec_memories dimensions match config ({})", embedding_dimensions);
+                                false
+                            }
+                        } else {
+                            eprintln!("[SharedMemory] Warning: Could not parse dimension from schema, assuming match");
+                            false
+                        }
+                    } else {
+                        eprintln!("[SharedMemory] Warning: Could not extract dimension from schema, assuming match");
+                        false
+                    }
+                } else {
+                    eprintln!("[SharedMemory] Warning: Could not find FLOAT[N] in schema, assuming match");
+                    false
+                }
+            };
+
+            if needs_recreation {
+                eprintln!("[SharedMemory] Dropping and recreating vec_memories table...");
                 db.execute("DROP TABLE vec_memories", [])?;
                 db.execute(
                     &format!(
@@ -181,7 +213,7 @@ impl SharedMemory {
                     ),
                     [],
                 )?;
-                eprintln!("[SharedMemory] ✓ vec_memories recreated with INTEGER PRIMARY KEY");
+                eprintln!("[SharedMemory] ✓ vec_memories recreated with {} dimensions", embedding_dimensions);
             }
         } else {
             // Table doesn't exist, create it

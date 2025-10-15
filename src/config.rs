@@ -57,6 +57,10 @@ fn default_vision_model() -> String {
     "llama3.2-vision:11b".to_string()
 }
 
+fn default_screenshot_wait_secs() -> u64 {
+    0
+}
+
 fn default_research_model() -> Option<String> {
     None // Will use main model if not specified
 }
@@ -105,6 +109,8 @@ pub struct OllamaConfig {
     pub summarization_threshold: usize,
     #[serde(default = "default_summarization_threshold_research")]
     pub summarization_threshold_research: usize,
+    #[serde(default = "default_screenshot_wait_secs")]
+    pub screenshot_wait_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -151,6 +157,7 @@ impl Default for Config {
                 max_tool_turns: 5,
                 summarization_threshold: 5000,
                 summarization_threshold_research: 50000,
+                screenshot_wait_secs: 0,
             },
             research: ResearchConfig::default(),
         }

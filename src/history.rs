@@ -11,6 +11,7 @@ pub struct HistoryEntry {
     pub response: String,
     #[allow(dead_code)]
     pub created_at: i64,
+    pub image_path: Option<String>,
 }
 
 fn db_path() -> PathBuf {
@@ -30,14 +31,27 @@ pub fn init() -> anyhow::Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             prompt TEXT NOT NULL,
             response TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            image_path TEXT
         )",
         [],
     )?;
+
+    // Migration: Add image_path column if it doesn't exist
+    let _ = conn.execute(
+        "ALTER TABLE history ADD COLUMN image_path TEXT",
+        [],
+    );
+    // Ignore error if column already exists
+
     Ok(())
 }
 
 pub fn add_entry(prompt: &str, response: &str) -> anyhow::Result<()> {
+    add_entry_with_image(prompt, response, None)
+}
+
+pub fn add_entry_with_image(prompt: &str, response: &str, image_path: Option<&str>) -> anyhow::Result<()> {
     ensure_dir()?;
     let conn = Connection::open(db_path())?;
     let now = std::time::SystemTime::now()
@@ -45,8 +59,8 @@ pub fn add_entry(prompt: &str, response: &str) -> anyhow::Result<()> {
         .unwrap_or_default()
         .as_secs() as i64;
     conn.execute(
-        "INSERT INTO history (prompt, response, created_at) VALUES (?1, ?2, ?3)",
-        params![prompt, response, now],
+        "INSERT INTO history (prompt, response, created_at, image_path) VALUES (?1, ?2, ?3, ?4)",
+        params![prompt, response, now, image_path],
     )?;
     Ok(())
 }
@@ -55,7 +69,7 @@ pub fn list_entries(limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
     ensure_dir()?;
     let conn = Connection::open(db_path())?;
     let mut stmt = conn.prepare(
-        "SELECT id, prompt, response, created_at
+        "SELECT id, prompt, response, created_at, image_path
          FROM history
          ORDER BY created_at DESC
          LIMIT ?1",
@@ -66,6 +80,7 @@ pub fn list_entries(limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
             prompt: row.get(1)?,
             response: row.get(2)?,
             created_at: row.get(3)?,
+            image_path: row.get(4)?,
         })
     })?;
 
@@ -81,7 +96,7 @@ pub fn get_entry(id: i64) -> anyhow::Result<Option<HistoryEntry>> {
     ensure_dir()?;
     let conn = Connection::open(db_path())?;
     let mut stmt = conn.prepare(
-        "SELECT id, prompt, response, created_at FROM history WHERE id = ?1"
+        "SELECT id, prompt, response, created_at, image_path FROM history WHERE id = ?1"
     )?;
     let mut rows = stmt.query([id])?;
     if let Some(row) = rows.next()? {
@@ -90,6 +105,7 @@ pub fn get_entry(id: i64) -> anyhow::Result<Option<HistoryEntry>> {
             prompt: row.get(1)?,
             response: row.get(2)?,
             created_at: row.get(3)?,
+            image_path: row.get(4)?,
         }))
     } else {
         Ok(None)

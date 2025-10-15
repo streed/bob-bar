@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone)]
 pub enum ResearchProgress {
     Started,
+    AnalyzingImage,
     Decomposing,
     PlanningIteration(usize, usize), // current iteration, max iterations
     PlanGenerated(usize), // number of sub-questions
@@ -175,6 +176,7 @@ impl ResearchOrchestrator {
         use crate::progress::{log_with, Kind};
         let (line, kind) = match progress {
             ResearchProgress::Started => ("Research started".to_string(), Kind::Info),
+            ResearchProgress::AnalyzingImage => ("Analyzing provided image".to_string(), Kind::Info),
             ResearchProgress::Decomposing => ("Decomposing query into sub-questions".to_string(), Kind::Info),
             ResearchProgress::PlanningIteration(i, max) => (format!("Planning iteration {}/{}", i, max), Kind::Info),
             ResearchProgress::PlanGenerated(n) => (format!("Generated plan with {} sub-questions", n), Kind::Info),
@@ -221,6 +223,11 @@ impl ResearchOrchestrator {
 
     /// Main entry point for research mode
     pub async fn research(&mut self, query: &str) -> Result<String> {
+        self.research_with_image(query, None).await
+    }
+
+    /// Research with optional image context (for screenshot analysis, diagrams, etc.)
+    pub async fn research_with_image(&mut self, query: &str, base64_image: Option<String>) -> Result<String> {
         // Generate unique query ID for this research session using timestamp + random
         use std::time::{SystemTime, UNIX_EPOCH};
         let timestamp = SystemTime::now()
@@ -251,9 +258,27 @@ impl ResearchOrchestrator {
             }
         }
 
+        // Step 0.5: If image provided, analyze it first
+        let image_analysis = if let Some(ref image) = base64_image {
+            eprintln!("[Research] Analyzing provided image...");
+            self.send_progress(ResearchProgress::AnalyzingImage);
+            match self.analyze_image(image).await {
+                Ok(analysis) => {
+                    eprintln!("[Research] ✓ Image analysis complete ({} chars)", analysis.len());
+                    Some(analysis)
+                }
+                Err(e) => {
+                    eprintln!("[Research] Warning: Failed to analyze image: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Step 1: Decompose query into sub-questions and create plan
         self.send_progress(ResearchProgress::Decomposing);
-        let (sub_questions, plan) = self.decompose_query_and_plan(query).await?;
+        let (sub_questions, plan) = self.decompose_query_and_plan(query, image_analysis.as_deref()).await?;
 
         if sub_questions.is_empty() {
             return Ok("Unable to decompose query into sub-questions.".to_string());
@@ -425,8 +450,34 @@ impl ResearchOrchestrator {
         Ok(final_document)
     }
 
+    /// Analyze an image to extract detailed information before research planning
+    async fn analyze_image(&self, base64_image: &str) -> Result<String> {
+        let prompt = "Please provide a detailed analysis of this image. Include:\n\
+            1. **Main Subject/Content**: What is the primary focus of the image?\n\
+            2. **Visual Elements**: Key objects, people, text, diagrams, charts, or other notable elements\n\
+            3. **Context & Setting**: Where/when does this appear to be? What's the environment?\n\
+            4. **Text Content**: Any visible text, labels, captions, or written information\n\
+            5. **Technical Details**: If applicable, any technical diagrams, code, data visualizations, or specialized content\n\
+            6. **Key Insights**: What information or message does this image convey?\n\
+            7. **Questions Raised**: What questions or topics does this image suggest for further research?\n\n\
+            Be thorough and specific in your analysis.";
+
+        let base_url = std::env::var("OLLAMA_HOST")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+
+        // Use the vision model for image analysis
+        let vision_model = std::env::var("VISION_MODEL")
+            .unwrap_or_else(|_| "llama3.2-vision:11b".to_string());
+
+        let mut vision_client = OllamaClient::with_config(base_url, vision_model);
+
+        let analysis = vision_client.query_with_image(prompt, base64_image).await?;
+
+        Ok(analysis)
+    }
+
     /// Decompose query into sub-questions and create research plan using lead agent
-    async fn decompose_query_and_plan(&self, query: &str) -> Result<(Vec<SubQuestion>, String)> {
+    async fn decompose_query_and_plan(&self, query: &str, image_analysis: Option<&str>) -> Result<(Vec<SubQuestion>, String)> {
         let max_iterations = self.ollama_config.max_plan_iterations;
         let mut current_plan = String::new();
         let mut current_questions_json = String::new();
@@ -437,8 +488,8 @@ impl ResearchOrchestrator {
 
             // Generate or refine the plan
             let (plan_response, questions_json) = if iteration == 0 {
-                // Initial plan generation
-                self.generate_initial_plan(query).await?
+                // Initial plan generation (with image analysis if provided)
+                self.generate_initial_plan(query, image_analysis).await?
             } else {
                 // Refine plan based on criticism
                 self.refine_plan(query, &current_plan, &current_questions_json).await?
@@ -479,11 +530,23 @@ impl ResearchOrchestrator {
     }
 
     /// Generate initial research plan
-    async fn generate_initial_plan(&self, query: &str) -> Result<(String, String)> {
+    async fn generate_initial_plan(&self, query: &str, image_analysis: Option<&str>) -> Result<(String, String)> {
+        let image_context = if let Some(analysis) = image_analysis {
+            format!(
+                "\n\n**IMAGE ANALYSIS**: An image was provided with this query. Here is the detailed analysis of the image:\n\n\
+                ---BEGIN IMAGE ANALYSIS---\n{}\n---END IMAGE ANALYSIS---\n\n\
+                Incorporate relevant details from this image analysis into your research plan. \
+                Consider what information from the image needs verification, expansion, or additional context.",
+                analysis
+            )
+        } else {
+            String::new()
+        };
+
         let prompt = format!(
             "{}\n\n**WORKER COUNT GUIDANCE**: Based on query complexity, create between {} and {} sub-questions. \
             Simple queries should use fewer workers (closer to {}), while complex multi-faceted queries should \
-            use more workers (closer to {}). The number of sub-questions determines how many workers will be spawned.\n\n\
+            use more workers (closer to {}). The number of sub-questions determines how many workers will be spawned.{}\n\n\
             Query: {}\n\nProvide your response in two parts:\n\
             1. JSON array of sub-questions (as before)\n\
             2. After the JSON, provide a brief research strategy/plan explaining the approach and what to focus on.",
@@ -492,6 +555,7 @@ impl ResearchOrchestrator {
             self.config.config.max_worker_count,
             self.config.config.min_worker_count,
             self.config.config.max_worker_count,
+            image_context,
             query
         );
 

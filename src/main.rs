@@ -12,7 +12,7 @@ mod shared_memory;
 mod dynamic_context;
 
 use iced::{
-    widget::{column, row, container, scrollable, text, text_input, button, text_input::Id, rich_text, span, text_editor, Space},
+    widget::{column, row, container, scrollable, text, text_input, button, text_input::Id, rich_text, span, text_editor, Space, image as img},
     Element, Length, Task, Theme, Font, Subscription,
     time, clipboard,
     keyboard::{self, Key},
@@ -508,7 +508,14 @@ fn main() -> iced::Result {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let screenshot_mode = args.iter().any(|arg| arg == "--screenshot" || arg == "-screenshot");
+    let region_mode = args.iter().any(|arg| arg == "--region" || arg == "-region");
     let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "-debug");
+
+    // Parse wait parameter (--wait=N or default from config)
+    let wait_override: Option<u64> = args.iter()
+        .find(|arg| arg.starts_with("--wait="))
+        .and_then(|arg| arg.strip_prefix("--wait="))
+        .and_then(|s| s.parse().ok());
 
     // Set debug mode globally
     DEBUG_MODE.store(debug_mode, Ordering::Relaxed);
@@ -520,8 +527,34 @@ fn main() -> iced::Result {
     let config = config::Config::load();
 
     if screenshot_mode {
-        // Run in screenshot mode
-        run_screenshot_mode(config)
+        // Run in screenshot mode - capture screenshot BEFORE opening app
+        let wait_secs = wait_override.unwrap_or(config.ollama.screenshot_wait_secs);
+
+        // Wait if requested
+        if wait_secs > 0 {
+            eprintln!("[Screenshot] Waiting {} seconds before capturing...", wait_secs);
+            std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+        }
+
+        // Capture screenshot now (with or without region selection)
+        let capture_result = if region_mode {
+            screenshot::capture_screenshot_region()
+        } else {
+            screenshot::capture_screenshot()
+        };
+
+        match capture_result {
+            Ok(screenshot_path) => {
+                eprintln!("[Screenshot] Captured: {}", screenshot_path.display());
+
+                // Now open the app with the screenshot
+                run_screenshot_mode(config, screenshot_path)
+            }
+            Err(e) => {
+                eprintln!("[Screenshot] Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     } else {
         // Normal mode
         iced::application("bob-bar", App::update, App::view)
@@ -544,14 +577,13 @@ fn main() -> iced::Result {
     }
 }
 
-fn run_screenshot_mode(_config: config::Config) -> iced::Result {
+fn run_screenshot_mode(_config: config::Config, screenshot_path: std::path::PathBuf) -> iced::Result {
     iced::application("bob-bar", App::update, App::view)
         .theme(App::theme)
         .subscription(App::subscription)
         .window(window::Settings {
             size: iced::Size::new(1200.0, 1200.0),
             position: window::Position::Centered,
-            // Screenshot mode should also not force always-on-top
             level: Level::Normal,
             decorations: true,
             resizable: true,
@@ -561,22 +593,20 @@ fn run_screenshot_mode(_config: config::Config) -> iced::Result {
             ..Default::default()
         })
         .default_font(Font::MONOSPACE)
-        .run_with(|| {
+        .run_with(move || {
             let (mut app, task) = App::new();
             app.screenshot_mode = true;
+            app.screenshot_path = Some(screenshot_path.clone());
 
-            // Capture screenshot after a small delay to allow window to be hidden
-            let screenshot_task = Task::future(async {
-                // Small delay to let the app window minimize/hide
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Load the screenshot image for display
+            let load_task = Task::perform(
+                async move {
+                    Message::ScreenshotCaptured(Ok(screenshot_path))
+                },
+                |msg| msg
+            );
 
-                match screenshot::capture_screenshot() {
-                    Ok(path) => Message::ScreenshotCaptured(Ok(path)),
-                    Err(e) => Message::ScreenshotCaptured(Err(e.to_string())),
-                }
-            });
-
-            (app, Task::batch([task, screenshot_task]))
+            (app, Task::batch([task, load_task]))
         })
 }
 
@@ -824,6 +854,7 @@ impl App {
 
                     let query = self.input_text.clone();
                     let orchestrator = self.research_orchestrator.clone().unwrap();
+                    let screenshot_path = self.screenshot_path.clone();
 
                     // For now, research progress updates are visible in terminal via eprintln
                     // Future enhancement: implement subscription-based progress streaming to UI
@@ -836,6 +867,7 @@ impl App {
                         while let Some(progress) = progress_rx.recv().await {
                             let msg = match progress {
                                 ResearchProgress::Started => "🚀 Starting research...".to_string(),
+                                ResearchProgress::AnalyzingImage => "🖼️ Analyzing provided image...".to_string(),
                                 ResearchProgress::Decomposing => "🔍 Decomposing query into sub-questions...".to_string(),
                                 ResearchProgress::PlanningIteration(i, max) => format!("📋 Planning iteration {}/{}", i, max),
                                 ResearchProgress::PlanGenerated(n) => format!("✓ Generated plan with {} sub-questions", n),
@@ -864,14 +896,27 @@ impl App {
                         }
                     });
 
-                    // Run the research task with cancellation support
+                    // Run the research task with cancellation support and optional image
                     Task::perform(
                         async move {
+                            // Encode image if available
+                            let base64_image = if let Some(ref path) = screenshot_path {
+                                match screenshot::encode_image_base64(path) {
+                                    Ok(img) => Some(img),
+                                    Err(e) => {
+                                        eprintln!("[Research] Warning: Failed to encode image: {}", e);
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
                             tokio::select! {
                                 result = async {
                                     let mut orch = orchestrator.lock().await;
                                     orch.set_progress_channel(progress_tx);
-                                    orch.research(&query).await
+                                    orch.research_with_image(&query, base64_image).await
                                 } => result,
                                 _ = cancel_token.cancelled() => {
                                     Err(anyhow::anyhow!("Query cancelled by user"))
@@ -883,6 +928,36 @@ impl App {
                             Err(e) => Message::Error(format!("Research error: {}", e)),
                         }
                     )
+                } else if let Some(ref screenshot_path) = self.screenshot_path {
+                    // Screenshot mode - query with image
+                    let prompt = self.input_text.clone();
+                    let client = self.ollama_client.clone();
+                    let vision_model = self.vision_model.clone();
+                    let screenshot_path = screenshot_path.clone();
+
+                    Task::future(async move {
+                        let mut client = client.lock().await;
+
+                        // Temporarily switch to vision model
+                        let original_model = client.get_model().to_string();
+                        client.set_model(vision_model);
+
+                        // Encode image as base64
+                        let result = match screenshot::encode_image_base64(&screenshot_path) {
+                            Ok(base64_image) => {
+                                client.query_with_image(&prompt, &base64_image).await
+                            }
+                            Err(e) => Err(anyhow::anyhow!("Error encoding image: {}", e)),
+                        };
+
+                        // Restore original model
+                        client.set_model(original_model);
+
+                        match result {
+                            Ok(response) => Message::ResponseReceived(response),
+                            Err(e) => Message::Error(format!("Error analyzing screenshot: {}", e)),
+                        }
+                    })
                 } else {
                     // Normal mode
                     let prompt = format!("{}\n\n{}", TABLE_PLAIN_TEXT_RULES, self.input_text.clone());
@@ -953,8 +1028,9 @@ impl App {
                     });
                 }
 
-                // Save to history and refresh list
-                let _ = history::add_entry(&self.input_text, &self.response_text);
+                // Save to history and refresh list (with screenshot path if applicable)
+                let image_path = self.screenshot_path.as_ref().map(|p| p.to_string_lossy().to_string());
+                let _ = history::add_entry_with_image(&self.input_text, &self.response_text, image_path.as_deref());
                 self.history = history::list_entries(100).unwrap_or_default();
 
                 // Also request window focus immediately
@@ -1002,6 +1078,7 @@ impl App {
                 if let Some(entry) = self.history.get(idx).cloned() {
                     self.input_text = entry.prompt;
                     self.response_text = entry.response;
+                    self.screenshot_path = entry.image_path.map(std::path::PathBuf::from);
                     self.selected_history = Some(idx);
                     self.is_loading = false;
                 }
@@ -1030,6 +1107,7 @@ impl App {
 
                 let progress_text = match progress {
                     ResearchProgress::Started => "🚀 Starting research...".to_string(),
+                    ResearchProgress::AnalyzingImage => "🖼️ Analyzing provided image...".to_string(),
                     ResearchProgress::Decomposing => "🔍 Decomposing query into sub-questions...".to_string(),
                     ResearchProgress::PlanningIteration(i, max) => format!("📋 Planning iteration {}/{}", i, max),
                     ResearchProgress::PlanGenerated(n) => format!("✓ Generated plan with {} sub-questions", n),
@@ -1092,66 +1170,8 @@ impl App {
                 match result {
                     Ok(path) => {
                         self.screenshot_path = Some(path.clone());
-                        self.is_loading = true;
-                        self.response_text = "Extracting information from screenshot...".to_string();
-                        self.input_text = "Reading and analyzing screen content...".to_string();
-
-                        let client = self.ollama_client.clone();
-                        let screenshot_path = path;
-                        let vision_model = self.vision_model.clone();
-
-                        Task::future(async move {
-                            let mut client = client.lock().await;
-
-                            // Temporarily switch to vision model
-                            let original_model = client.get_model().to_string();
-                            client.set_model(vision_model);
-
-                            // Encode image as base64
-                            let result = match screenshot::encode_image_base64(&screenshot_path) {
-                                Ok(base64_image) => {
-                                    client.query_with_image(
-                                        "You are analyzing a screenshot. Your task is to extract and report ONLY what you can directly see and read.
-
-**CRITICAL RULES:**
-- ONLY report text, numbers, and visual elements you can actually see in the image
-- DO NOT guess, infer, or make assumptions about anything not clearly visible
-- DO NOT explain what code does unless you can see comments or documentation explaining it
-- DO NOT suggest fixes unless error messages explicitly state the solution
-- If text is unclear or partially visible, state \"text unclear\" rather than guessing
-- If you cannot see something clearly, say \"not visible in screenshot\"
-
-**What to extract:**
-1. **Visible text** - Transcribe exactly what you see: error messages, button labels, terminal output, code
-2. **Visible numbers** - Version numbers, error codes, line numbers, timestamps
-3. **Visible UI elements** - Application name (if shown), window titles, menu items
-4. **Visible structure** - File paths, URLs, command names (only if clearly visible)
-
-**Formatting rules:**
-- When including tables in your response, do not apply styling to table headers or table cell values. Use plain text inside tables (no bold/italic/code inside table cells).
-- Do not use Unicode symbols or emoji inside tables; use plain ASCII text only (letters, numbers, basic punctuation).
-
-**Format your response as:**
-- **Text Content:** [Quote exact text you see]
-- **Key Information:** [Only concrete data visible: error codes, versions, paths]
-- **Visual Context:** [What application/interface is shown, if identifiable]
-- **Notable Elements:** [Any important UI elements or indicators you see]
-
-Remember: Only report what is objectively visible. Do not interpret, explain, or suggest unless the image itself contains that information.",
-                                        &base64_image
-                                    ).await
-                                }
-                                Err(e) => Err(anyhow::anyhow!("Error encoding image: {}", e)),
-                            };
-
-                            // Restore original model
-                            client.set_model(original_model);
-
-                            match result {
-                                Ok(response) => Message::ResponseReceived(response),
-                                Err(e) => Message::Error(format!("Error analyzing screenshot: {}", e)),
-                            }
-                        })
+                        self.response_text = format!("📸 Screenshot captured: {}\n\nAsk a question about this image using the input above.", path.display());
+                        Task::none()
                     }
                     Err(e) => {
                         self.response_text = format!("Error capturing screenshot: {}", e);
@@ -1449,8 +1469,23 @@ Remember: Only report what is objectively visible. Do not interpret, explain, or
                 .align_y(alignment::Vertical::Center)
                 .into()
             } else {
+                // Build output content with optional screenshot image
+                let mut output_elements: Vec<Element<Message>> = Vec::new();
+
+                // Add screenshot image if available
+                if let Some(ref screenshot_path) = self.screenshot_path {
+                    if screenshot_path.exists() {
+                        let image_widget = img(screenshot_path.to_string_lossy().to_string())
+                            .width(Length::Fixed(800.0));
+                        output_elements.push(container(image_widget).padding(10).into());
+                    }
+                }
+
+                // Add response text
+                output_elements.push(render_markdown(self.response_text.clone()));
+
                 scrollable(
-                    container(render_markdown(self.response_text.clone()))
+                    container(column(output_elements).spacing(10))
                         .padding(15)
                         .width(Length::Fill)
                 )
