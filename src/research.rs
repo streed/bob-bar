@@ -20,6 +20,7 @@ pub enum ResearchProgress {
     #[allow(dead_code)]
     WorkerStarted { worker: String, question: String },
     WorkerStatus { worker: String, status: String },
+    #[allow(dead_code)]
     SupervisorAnalyzing,
     FollowUpQuestionsGenerated(usize), // number of follow-ups
     Combining,
@@ -95,6 +96,7 @@ pub struct ResearchOrchestrator {
     tool_executor: Option<Arc<Mutex<ToolExecutor>>>,
     shared_memory: Option<Arc<crate::shared_memory::SharedMemory>>,
     progress_tx: Option<mpsc::UnboundedSender<ResearchProgress>>,
+    #[allow(dead_code)]
     context_window: usize,
     research_model: String,
     max_tool_turns: usize,
@@ -222,6 +224,7 @@ impl ResearchOrchestrator {
     }
 
     /// Main entry point for research mode
+    #[allow(dead_code)]
     pub async fn research(&mut self, query: &str) -> Result<String> {
         self.research_with_image(query, None).await
     }
@@ -1685,7 +1688,7 @@ impl ResearchOrchestrator {
         let mut output = format!("# Research Results for: {}\n\n", original_query);
         let num_workers = results.len();
 
-        for (idx, result) in results.iter().enumerate() {
+        for (_idx, result) in results.iter().enumerate() {
             // Show progress for summarization if needed
             if result.answer.len() > self.ollama_config.summarization_threshold_research {
                 self.send_progress(ResearchProgress::Summarizing);

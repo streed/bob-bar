@@ -47,6 +47,7 @@ pub fn init() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn add_entry(prompt: &str, response: &str) -> anyhow::Result<()> {
     add_entry_with_image(prompt, response, None)
 }
