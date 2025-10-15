@@ -185,6 +185,21 @@ Screenshot analysis mode:
 bob-bar --screenshot
 ```
 
+Screenshot with region selection:
+```bash
+bob-bar --screenshot --region
+```
+
+Screenshot with default prompt:
+```bash
+bob-bar --screenshot --prompt "What errors do you see?"
+```
+
+Screenshot with wait time (useful for capturing menus):
+```bash
+bob-bar --screenshot --wait=3 --prompt "Analyze this interface"
+```
+
 Debug mode (shows detailed logging):
 ```bash
 bob-bar --debug
@@ -277,15 +292,39 @@ This will:
 3. Display helpful insights about what's on screen
 4. Identify issues, extract information, and suggest improvements
 
+**Advanced Options:**
+
+Region selection (capture part of screen):
+```bash
+bob-bar --screenshot --region
+```
+
+Default prompt (pre-fill the input field):
+```bash
+bob-bar --screenshot --prompt "What errors do you see in this code?"
+```
+
+Wait before capturing (useful for menus/tooltips):
+```bash
+bob-bar --screenshot --wait=3
+```
+
+Combine all options:
+```bash
+bob-bar --screenshot --region --wait=2 --prompt "Transcribe all visible text"
+```
+
 **Requirements:**
-- Wayland: Install `grim` (`sudo apt install grim` or `sudo pacman -S grim`)
+- Wayland: Install `grim` and `slurp` for region selection (`sudo apt install grim slurp` or `sudo pacman -S grim slurp`)
 - X11: Install `scrot` (`sudo apt install scrot`)
 
-Great for:
+**Great for:**
 - Getting help with error messages
 - Understanding complex UIs
 - Extracting text from images
 - Analyzing diagrams and charts
+- OCR (text extraction from screenshots)
+- Debugging visual issues
 
 ### Keyboard Shortcuts
 

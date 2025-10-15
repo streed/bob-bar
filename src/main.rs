@@ -517,6 +517,21 @@ fn main() -> iced::Result {
         .and_then(|arg| arg.strip_prefix("--wait="))
         .and_then(|s| s.parse().ok());
 
+    // Parse prompt parameter (--prompt="..." or --prompt "...")
+    let default_prompt: Option<String> = args.iter()
+        .position(|arg| arg == "--prompt" || arg.starts_with("--prompt="))
+        .and_then(|pos| {
+            if args[pos].starts_with("--prompt=") {
+                // Format: --prompt="text"
+                args[pos].strip_prefix("--prompt=").map(|s| s.trim_matches('"').to_string())
+            } else if pos + 1 < args.len() {
+                // Format: --prompt "text"
+                Some(args[pos + 1].trim_matches('"').to_string())
+            } else {
+                None
+            }
+        });
+
     // Set debug mode globally
     DEBUG_MODE.store(debug_mode, Ordering::Relaxed);
     if debug_mode {
@@ -548,7 +563,7 @@ fn main() -> iced::Result {
                 eprintln!("[Screenshot] Captured: {}", screenshot_path.display());
 
                 // Now open the app with the screenshot
-                run_screenshot_mode(config, screenshot_path)
+                run_screenshot_mode(config, screenshot_path, default_prompt)
             }
             Err(e) => {
                 eprintln!("[Screenshot] Error: {}", e);
@@ -577,7 +592,7 @@ fn main() -> iced::Result {
     }
 }
 
-fn run_screenshot_mode(_config: config::Config, screenshot_path: std::path::PathBuf) -> iced::Result {
+fn run_screenshot_mode(_config: config::Config, screenshot_path: std::path::PathBuf, default_prompt: Option<String>) -> iced::Result {
     iced::application("bob-bar", App::update, App::view)
         .theme(App::theme)
         .subscription(App::subscription)
@@ -598,6 +613,12 @@ fn run_screenshot_mode(_config: config::Config, screenshot_path: std::path::Path
             app.screenshot_mode = true;
             app.screenshot_path = Some(screenshot_path.clone());
 
+            // Set default prompt if provided
+            let auto_submit = default_prompt.is_some();
+            if let Some(prompt) = default_prompt.clone() {
+                app.input_text = prompt;
+            }
+
             // Load the screenshot image for display
             let load_task = Task::perform(
                 async move {
@@ -606,7 +627,14 @@ fn run_screenshot_mode(_config: config::Config, screenshot_path: std::path::Path
                 |msg| msg
             );
 
-            (app, Task::batch([task, load_task]))
+            // Auto-submit if prompt was provided
+            let submit_task = if auto_submit {
+                Task::done(Message::Submit)
+            } else {
+                Task::none()
+            };
+
+            (app, Task::batch([task, load_task, submit_task]))
         })
 }
 
@@ -1170,7 +1198,10 @@ impl App {
                 match result {
                     Ok(path) => {
                         self.screenshot_path = Some(path.clone());
-                        self.response_text = format!("📸 Screenshot captured: {}\n\nAsk a question about this image using the input above.", path.display());
+                        // Only set placeholder text if response is empty (avoid overwriting actual results)
+                        if self.response_text.is_empty() {
+                            self.response_text = format!("📸 Screenshot captured: {}\n\nAsk a question about this image using the input above.", path.display());
+                        }
                         Task::none()
                     }
                     Err(e) => {
