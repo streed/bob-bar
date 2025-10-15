@@ -854,6 +854,7 @@ impl App {
                                 ResearchProgress::Refining(current, max) => format!("✨ Refining output (iteration {}/{})", current, max),
                                 ResearchProgress::WritingDocument(current, max) => format!("✍️ Writing document (iteration {}/{})", current, max),
                                 ResearchProgress::DocumentReviewing => "📝 Document critic reviewing...".to_string(),
+                                ResearchProgress::AddingBibliography => "📚 Adding bibliography...".to_string(),
                                 ResearchProgress::ExportingMemories => "💾 Exporting research memories...".to_string(),
                                 ResearchProgress::Completed => "🎉 Research complete!".to_string(),
                             };
@@ -1047,6 +1048,7 @@ impl App {
                     ResearchProgress::Refining(current, max) => format!("✨ Refining output (iteration {}/{})", current, max),
                     ResearchProgress::WritingDocument(current, max) => format!("✍️ Writing document (iteration {}/{})", current, max),
                     ResearchProgress::DocumentReviewing => "📝 Document critic reviewing...".to_string(),
+                    ResearchProgress::AddingBibliography => "📚 Adding bibliography...".to_string(),
                     ResearchProgress::ExportingMemories => "💾 Exporting research memories...".to_string(),
                     ResearchProgress::Completed => "🎉 Research complete!".to_string(),
                 };

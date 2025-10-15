@@ -28,6 +28,7 @@ pub enum ResearchProgress {
     DebateRound(usize, usize), // current round, max rounds
     WritingDocument(usize, usize), // current iteration, max iterations
     DocumentReviewing,
+    AddingBibliography,
     ExportingMemories,
     Completed,
 }
@@ -203,6 +204,7 @@ impl ResearchOrchestrator {
             ResearchProgress::WritingDocument(i, max) => (format!("Writing document (iteration {}/{})", i, max), Kind::Writer),
             ResearchProgress::DocumentReviewing => ("Document critic reviewing".to_string(), Kind::DocumentCritic),
             ResearchProgress::ExportingMemories => ("Exporting research memories".to_string(), Kind::Info),
+            ResearchProgress::AddingBibliography => ("Adding bibliography".to_string(), Kind::Writer),
             ResearchProgress::Completed => ("Research complete".to_string(), Kind::Info),
         };
         log_with(kind, line);
